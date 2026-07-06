@@ -12,7 +12,11 @@ with a menu for pause/resume, poll interval, open saves folder, open logs, reset
 > **This repository is a public, read-only mirror** of the agent's source from the grailward
 > monorepo — published so you can read the exact code and build/run the agent yourself
 > instead of trusting our (currently unsigned) binaries. Development happens upstream and is
-> mirrored here; issues are welcome, but code changes land in the private monorepo.
+> mirrored here.
+>
+> **Contributing:** issues — bug reports and ideas — are very welcome. Because this is a mirror,
+> its tree is overwritten on every sync, so PRs can't be merged here directly; but a fix you
+> propose (in an issue or a PR) gets re-applied upstream in the monorepo, with credit.
 
 ## What it does — the whole protocol
 
