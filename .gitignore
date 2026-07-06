@@ -1,0 +1,8 @@
+# Ignore binaries and build output
+build/
+*.exe
+agent
+
+# Ignore local config files
+config.json
+*.local.json

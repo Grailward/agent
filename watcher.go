@@ -1,0 +1,304 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type FileStat struct {
+	Mtime time.Time
+	Size  int64
+}
+
+// State is the coarse run state surfaced to the tray (icon color + tooltip).
+type State int
+
+const (
+	StateSyncing State = iota // actively watching/uploading (gold)
+	StatePaused               // user paused the sync (grey)
+	StateError                // last scan or upload failed (red)
+)
+
+// StatusFunc receives coarse state + a human-readable line for the tray/menu.
+type StatusFunc func(state State, message string)
+
+type Watcher struct {
+	Config   *Config
+	Client   *Client
+	Pending  map[string]FileStat
+	Uploaded map[string]string // path -> sha256
+	lastLine map[string]string // path -> last line logged, to suppress repeats
+	Machine  string
+
+	mu       sync.Mutex
+	paused   bool
+	interval time.Duration
+	reset    chan struct{} // wakes the loop when interval/pause changes
+	onStatus StatusFunc
+}
+
+func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	return &Watcher{
+		Config:   cfg,
+		Client:   client,
+		Pending:  make(map[string]FileStat),
+		Uploaded: make(map[string]string),
+		lastLine: make(map[string]string),
+		Machine:  hostname,
+		interval: time.Duration(cfg.PollInterval * float64(time.Second)),
+		reset:    make(chan struct{}, 1),
+	}, nil
+}
+
+// SetStatusFunc registers the callback used to report state to the tray.
+// A no-op default keeps headless/CLI runs working.
+func (w *Watcher) SetStatusFunc(f StatusFunc) {
+	w.mu.Lock()
+	w.onStatus = f
+	w.mu.Unlock()
+}
+
+func (w *Watcher) status(state State, message string) {
+	w.mu.Lock()
+	f := w.onStatus
+	w.mu.Unlock()
+	if f != nil {
+		f(state, message)
+	}
+}
+
+// Paused reports whether the sync loop is currently paused.
+func (w *Watcher) Paused() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.paused
+}
+
+// SetPaused toggles the sync loop on/off without stopping the process.
+func (w *Watcher) SetPaused(p bool) {
+	w.mu.Lock()
+	w.paused = p
+	w.mu.Unlock()
+	w.wake()
+	if p {
+		w.status(StatePaused, "Sync paused")
+	} else {
+		w.status(StateSyncing, "Watching for changes")
+	}
+}
+
+// SetInterval changes the poll cadence live and persists it to config.
+func (w *Watcher) SetInterval(seconds float64) {
+	w.mu.Lock()
+	w.interval = time.Duration(seconds * float64(time.Second))
+	w.Config.PollInterval = seconds
+	w.mu.Unlock()
+	w.wake()
+	if path, err := GetConfigPath(); err == nil {
+		if err := SaveConfig(path, w.Config); err != nil {
+			log.Printf("Could not persist poll interval: %v", err)
+		}
+	}
+}
+
+func (w *Watcher) currentInterval() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.interval <= 0 {
+		return time.Duration(DefaultPollInterval * float64(time.Second))
+	}
+	return w.interval
+}
+
+// wake nudges the loop to re-read pause/interval immediately.
+func (w *Watcher) wake() {
+	select {
+	case w.reset <- struct{}{}:
+	default:
+	}
+}
+
+// Start runs the polling loop until the process exits. It reacts live to
+// SetPaused/SetInterval via the reset channel.
+func (w *Watcher) Start() {
+	log.Printf("Watching directory: %s -> %s (poll interval: %.1fs)", w.Config.SavesDir, w.Config.URL, w.Config.PollInterval)
+	w.status(StateSyncing, "Watching for changes")
+
+	w.scanIfActive()
+
+	for {
+		timer := time.NewTimer(w.currentInterval())
+		select {
+		case <-timer.C:
+			w.scanIfActive()
+		case <-w.reset:
+			timer.Stop()
+		}
+	}
+}
+
+func (w *Watcher) scanIfActive() {
+	if w.Paused() {
+		return
+	}
+	w.Scan()
+}
+
+// Scan performs a single directory scan.
+func (w *Watcher) Scan() {
+	entries, err := os.ReadDir(w.Config.SavesDir)
+	if err != nil {
+		log.Printf("Error reading saves directory %s: %v", w.Config.SavesDir, err)
+		w.status(StateError, "Cannot read saves folder")
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext != ".d2s" && ext != ".d2i" {
+			continue
+		}
+
+		path := filepath.Join(w.Config.SavesDir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		currentStat := FileStat{
+			Mtime: info.ModTime(),
+			Size:  info.Size(),
+		}
+
+		// Debounce: skip if file is new or modified since last check
+		pending, exists := w.Pending[path]
+		if !exists || !pending.Mtime.Equal(currentStat.Mtime) || pending.Size != currentStat.Size {
+			w.Pending[path] = currentStat
+			continue
+		}
+
+		bytes, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			log.Printf("Error reading file %s: %v", entry.Name(), err)
+			continue
+		}
+
+		var valid bool
+		if ext == ".d2i" {
+			valid = validStash(bytes)
+		} else {
+			valid = validSave(bytes)
+		}
+
+		if !valid {
+			continue
+		}
+
+		hash := sha256.Sum256(bytes)
+		sha256Hex := hex.EncodeToString(hash[:])
+
+		if w.Uploaded[path] == sha256Hex {
+			continue
+		}
+
+		w.upload(entry.Name(), path, bytes, sha256Hex)
+	}
+}
+
+func (w *Watcher) upload(filename, path string, bytes []byte, sha256Hex string) {
+	resp, err := w.Client.UploadSnapshot(filename, bytes, sha256Hex, w.Machine)
+	if err != nil {
+		w.logOnce(path, fmt.Sprintf("%s: network failure (%v); will retry in next scan", filename, err))
+		w.status(StateError, "Network failure — will retry")
+		return
+	}
+
+	if resp.Error != "" {
+		w.logOnce(path, fmt.Sprintf("%s: ERROR — %s", filename, resp.Error))
+		w.status(StateError, filename+": "+resp.Error)
+		return
+	}
+
+	w.Uploaded[path] = sha256Hex
+
+	if resp.SharedStash != nil {
+		w.logOnce(path, fmt.Sprintf("%s: %s (stash %s, %d items)", filename, resp.Status, resp.SharedStash.Mode, resp.SharedStash.ItemCount))
+	} else if resp.Character != nil {
+		w.logOnce(path, fmt.Sprintf("%s: %s (%s lvl %d)", filename, resp.Status, resp.Character.Name, resp.Character.Level))
+	} else {
+		w.logOnce(path, fmt.Sprintf("%s: %s", filename, resp.Status))
+	}
+	w.status(StateSyncing, "Synced "+filename)
+}
+
+// logOnce logs a per-file line only when it differs from the last line logged
+// for that file. A persistent, unchanged condition (e.g. an invalid token that
+// fails every poll) is logged once instead of flooding the file every scan;
+// the next distinct outcome (recovery, a new error) logs again. Runs on the
+// single scan goroutine, so the map needs no lock.
+func (w *Watcher) logOnce(path, line string) {
+	if w.lastLine[path] == line {
+		return
+	}
+	w.lastLine[path] = line
+	log.Print(line)
+}
+
+// validSave validates a .d2s character file using signature and size header check.
+func validSave(bytes []byte) bool {
+	if len(bytes) < 12 {
+		return false
+	}
+	sig := binary.LittleEndian.Uint32(bytes[0:4])
+	if sig != 0xAA55AA55 {
+		return false
+	}
+	fileSize := binary.LittleEndian.Uint32(bytes[8:12])
+	return fileSize == uint32(len(bytes))
+}
+
+// validStash validates a .d2i shared stash file checking signatures and chained tab sizes.
+func validStash(bytes []byte) bool {
+	offset := 0
+	length := len(bytes)
+	if length == 0 {
+		return false
+	}
+	for offset < length {
+		if offset+4 > length {
+			return false
+		}
+		sig := binary.LittleEndian.Uint32(bytes[offset : offset+4])
+		if sig != 0xAA55AA55 {
+			return false
+		}
+		if offset+18 > length {
+			return false
+		}
+		tabSize := int(binary.LittleEndian.Uint16(bytes[offset+16 : offset+18]))
+		if tabSize < 64 {
+			return false
+		}
+		offset += tabSize
+	}
+	return offset == length && offset > 0
+}
