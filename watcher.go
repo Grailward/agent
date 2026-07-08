@@ -30,19 +30,42 @@ const (
 // StatusFunc receives coarse state + a human-readable line for the tray/menu.
 type StatusFunc func(state State, message string)
 
-type Watcher struct {
-	Config   *Config
-	Client   *Client
-	Pending  map[string]FileStat
-	Uploaded map[string]string // path -> sha256
-	lastLine map[string]string // path -> last line logged, to suppress repeats
-	Machine  string
+// NewerFunc reports how many server saves are newer than the local copy, so the
+// tray can update the "Pull latest now" label. Two-way mode only.
+type NewerFunc func(count int)
 
-	mu       sync.Mutex
-	paused   bool
-	interval time.Duration
-	reset    chan struct{} // wakes the loop when interval/pause changes
-	onStatus StatusFunc
+// syncCheckInterval is how often two-way mode silently re-checks the server for
+// newer saves (status/label only — never a dialog or a write).
+const syncCheckInterval = 5 * time.Minute
+
+type Watcher struct {
+	Config    *Config
+	Client    *Client
+	Pending   map[string]FileStat
+	Uploaded  map[string]string // path -> sha256
+	lastLine  map[string]string // path -> last line logged, to suppress repeats
+	Machine   string
+	syncState *SyncState
+
+	mu         sync.Mutex
+	paused     bool
+	interval   time.Duration
+	newerCount int
+	reset      chan struct{} // wakes the loop when interval/pause changes
+	pullReq    chan struct{} // requests an interactive pull on the scan goroutine
+	onStatus   StatusFunc
+	onNewer    NewerFunc
+
+	// persistMu serializes config.json writes so concurrent preference changes
+	// (interval / sync mode / token, driven from different tray goroutines)
+	// can't interleave or lose one another's update.
+	persistMu sync.Mutex
+
+	// Test seams for the interactive/OS-dependent pieces of the pull; default
+	// to the real platform implementations in NewWatcher.
+	confirmPull     func(message string) (bool, error)
+	resolveConflict func(filename string) (ConflictChoice, error)
+	gameRunning     func(savesDir string, before time.Time) (bool, string)
 }
 
 func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
@@ -50,15 +73,21 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 	if err != nil {
 		hostname = "unknown"
 	}
+	statePath, _ := SyncStatePath()
 	return &Watcher{
-		Config:   cfg,
-		Client:   client,
-		Pending:  make(map[string]FileStat),
-		Uploaded: make(map[string]string),
-		lastLine: make(map[string]string),
-		Machine:  hostname,
-		interval: time.Duration(cfg.PollInterval * float64(time.Second)),
-		reset:    make(chan struct{}, 1),
+		Config:          cfg,
+		Client:          client,
+		Pending:         make(map[string]FileStat),
+		Uploaded:        make(map[string]string),
+		lastLine:        make(map[string]string),
+		Machine:         hostname,
+		syncState:       LoadSyncState(statePath),
+		interval:        time.Duration(cfg.PollInterval * float64(time.Second)),
+		reset:           make(chan struct{}, 1),
+		pullReq:         make(chan struct{}, 1),
+		confirmPull:     ConfirmPull,
+		resolveConflict: ResolveConflict,
+		gameRunning:     GameLikelyRunning,
 	}, nil
 }
 
@@ -76,6 +105,64 @@ func (w *Watcher) status(state State, message string) {
 	w.mu.Unlock()
 	if f != nil {
 		f(state, message)
+	}
+}
+
+// SetNewerFunc registers the callback used to report the count of newer server
+// saves to the tray.
+func (w *Watcher) SetNewerFunc(f NewerFunc) {
+	w.mu.Lock()
+	w.onNewer = f
+	w.mu.Unlock()
+}
+
+// setNewer stores the newer-save count and notifies the tray if it changed.
+func (w *Watcher) setNewer(count int) {
+	w.mu.Lock()
+	changed := w.newerCount != count
+	w.newerCount = count
+	f := w.onNewer
+	w.mu.Unlock()
+	if changed && f != nil {
+		f(count)
+	}
+}
+
+// SyncMode returns the current sync mode (push or two_way).
+func (w *Watcher) SyncMode() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.Config.SyncMode == SyncModeTwoWay {
+		return SyncModeTwoWay
+	}
+	return SyncModePush
+}
+
+// SetSyncMode switches sync mode live and persists it to config. Switching to
+// two-way requests an immediate pull check; switching to push clears any
+// pending newer-count badge.
+func (w *Watcher) SetSyncMode(mode string) {
+	if mode != SyncModeTwoWay {
+		mode = SyncModePush
+	}
+	w.mu.Lock()
+	w.Config.SyncMode = mode
+	w.mu.Unlock()
+	w.persistConfig()
+	if mode == SyncModeTwoWay {
+		w.RequestPull()
+	} else {
+		w.setNewer(0)
+		w.status(StateSyncing, "Watching for changes")
+	}
+}
+
+// RequestPull asks the scan goroutine to run an interactive pull. It is a
+// non-blocking nudge (deduplicated by the buffered channel), mirroring wake().
+func (w *Watcher) RequestPull() {
+	select {
+	case w.pullReq <- struct{}{}:
+	default:
 	}
 }
 
@@ -106,10 +193,38 @@ func (w *Watcher) SetInterval(seconds float64) {
 	w.Config.PollInterval = seconds
 	w.mu.Unlock()
 	w.wake()
-	if path, err := GetConfigPath(); err == nil {
-		if err := SaveConfig(path, w.Config); err != nil {
-			log.Printf("Could not persist poll interval: %v", err)
-		}
+	w.persistConfig()
+}
+
+// SetToken swaps the stored API token and persists it. Used by the tray "Reset
+// token" action; the live HTTP client is updated separately by the caller.
+func (w *Watcher) SetToken(token string) {
+	w.mu.Lock()
+	w.Config.Token = token
+	w.mu.Unlock()
+	w.persistConfig()
+}
+
+// persistConfig writes the current config to disk under a dedicated mutex so
+// only one writer runs at a time. It snapshots the Config under w.mu (never
+// handing the live, concurrently-mutated struct to the JSON marshaler) and
+// SaveConfig itself is atomic, so the on-disk file always reflects a coherent,
+// most-recent state without lost updates.
+func (w *Watcher) persistConfig() {
+	w.persistMu.Lock()
+	defer w.persistMu.Unlock()
+
+	path, err := GetConfigPath()
+	if err != nil {
+		log.Printf("Could not resolve config path: %v", err)
+		return
+	}
+	w.mu.Lock()
+	snapshot := *w.Config
+	w.mu.Unlock()
+
+	if err := SaveConfig(path, &snapshot); err != nil {
+		log.Printf("Could not persist config: %v", err)
 	}
 }
 
@@ -131,20 +246,45 @@ func (w *Watcher) wake() {
 }
 
 // Start runs the polling loop until the process exits. It reacts live to
-// SetPaused/SetInterval via the reset channel.
+// SetPaused/SetInterval via the reset channel, runs interactive pulls requested
+// via pullReq, and does the periodic two-way check on its own timer.
+//
+// Every pull action (dialogs, downloads, writes, sync_state and map updates)
+// runs here on this single goroutine, exactly like the scan, so the watcher
+// maps stay lock-free. The tray only ever nudges channels; native dialogs are
+// separate processes that block this goroutine while open, which is desired —
+// no upload or write races a pending user confirmation.
 func (w *Watcher) Start() {
-	log.Printf("Watching directory: %s -> %s (poll interval: %.1fs)", w.Config.SavesDir, w.Config.URL, w.Config.PollInterval)
+	w.mu.Lock()
+	poll := w.Config.PollInterval
+	w.mu.Unlock()
+	log.Printf("Watching directory: %s -> %s (poll interval: %.1fs, mode: %s)", w.Config.SavesDir, w.Config.URL, poll, w.SyncMode())
 	w.status(StateSyncing, "Watching for changes")
 
 	w.scanIfActive()
 
+	// Kick off the startup pull check for two-way mode.
+	if w.SyncMode() == SyncModeTwoWay {
+		w.RequestPull()
+	}
+
+	syncTimer := time.NewTimer(syncCheckInterval)
+	defer syncTimer.Stop()
+
 	for {
-		timer := time.NewTimer(w.currentInterval())
+		scanTimer := time.NewTimer(w.currentInterval())
 		select {
-		case <-timer.C:
+		case <-scanTimer.C:
 			w.scanIfActive()
+		case <-w.pullReq:
+			scanTimer.Stop()
+			w.runPull()
+		case <-syncTimer.C:
+			scanTimer.Stop()
+			w.periodicSyncCheck()
+			syncTimer.Reset(syncCheckInterval)
 		case <-w.reset:
-			timer.Stop()
+			scanTimer.Stop()
 		}
 	}
 }
@@ -239,6 +379,9 @@ func (w *Watcher) upload(filename, path string, bytes []byte, sha256Hex string) 
 	}
 
 	w.Uploaded[path] = sha256Hex
+	// Record the confirmed sync so two-way mode can tell a plain local edit
+	// apart from a genuine conflict later. Harmless in push-only mode.
+	w.recordSync(filename, sha256Hex)
 
 	if resp.SharedStash != nil {
 		w.logOnce(path, fmt.Sprintf("%s: %s (stash %s, %d items)", filename, resp.Status, resp.SharedStash.Mode, resp.SharedStash.ItemCount))

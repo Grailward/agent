@@ -6,12 +6,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 const (
 	DefaultURL          = "https://grailward.com"
 	DefaultPollInterval = 2.0
+)
+
+// Sync modes select how the agent reconciles local and server saves.
+//   - SyncModePush (default): the agent only uploads local changes; it never
+//     writes to the saves folder.
+//   - SyncModeTwoWay: the agent additionally offers to pull newer server saves
+//     onto disk. Every write is opt-in and requires explicit user confirmation.
+const (
+	SyncModePush   = "push"
+	SyncModeTwoWay = "two_way"
 )
 
 // Version is the build version, injected at build time via
@@ -23,6 +32,17 @@ type Config struct {
 	Token        string  `json:"token"`
 	SavesDir     string  `json:"saves_dir"`
 	PollInterval float64 `json:"poll_interval"`
+	SyncMode     string  `json:"sync_mode"`
+}
+
+// ConfigDir returns the directory holding config.json (and the sync state and
+// backups that live beside it).
+func ConfigDir() (string, error) {
+	path, err := GetConfigPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(path), nil
 }
 
 // GetConfigPath returns the path to config.json in the OS-specific user config directory.
@@ -50,21 +70,35 @@ func LoadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// SaveConfig saves the configuration to the file.
+// SaveConfig saves the configuration atomically: it marshals to a temp file in
+// the same directory, then renames over the target. A crash or a concurrent
+// writer can never leave a truncated/half-streamed config.json behind.
 func SaveConfig(path string, cfg *Config) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	file, err := os.Create(path)
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	data = append(data, '\n') // match the previous encoder's trailing newline
 
-	enc := json.NewEncoder(file)
-	enc.SetIndent("", "  ")
-	return enc.Encode(cfg)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // ClearToken erases the stored token (keeping url/saves_dir/interval) and
@@ -76,28 +110,6 @@ func ClearToken(cfg *Config) error {
 		return err
 	}
 	return SaveConfig(path, cfg)
-}
-
-// PromptAndSaveToken opens the native token dialog, stores the result and
-// persists it. Returns the new token (empty if the user cancelled).
-func PromptAndSaveToken(cfg *Config) (string, error) {
-	token, err := PromptToken(cfg.URL)
-	if err != nil {
-		return "", err
-	}
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return "", nil
-	}
-	cfg.Token = token
-	path, err := GetConfigPath()
-	if err != nil {
-		return "", err
-	}
-	if err := SaveConfig(path, cfg); err != nil {
-		return "", err
-	}
-	return token, nil
 }
 
 // SetupConfig parses CLI flags and returns the final configuration.
@@ -164,6 +176,12 @@ func SetupConfig() (*Config, error) {
 	// Override SavesDir CLI override if provided
 	if *savesDirFlag != "" {
 		cfg.SavesDir = *savesDirFlag
+	}
+
+	// Default to push-only sync (never writes to disk) unless the config picks
+	// two-way explicitly.
+	if cfg.SyncMode != SyncModeTwoWay {
+		cfg.SyncMode = SyncModePush
 	}
 
 	// Check if Token or SavesDir is missing and needs prompt

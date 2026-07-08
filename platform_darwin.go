@@ -1,4 +1,5 @@
 //go:build darwin
+
 package main
 
 import (
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // GetDefaultSavesDir returns the standard macOS D2R saves path via CrossOver.
@@ -60,4 +62,99 @@ func PromptSavesDir(defaultPath string) (string, error) {
 	}
 
 	return strings.TrimSpace(out.String()), nil
+}
+
+// escapeAppleScript escapes a string for embedding in a double-quoted
+// AppleScript literal, turning newlines into AppleScript line breaks so the
+// dialog renders multi-line text without breaking the script.
+func escapeAppleScript(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", "\" & return & \"")
+	return s
+}
+
+// runOsascript runs a one-line AppleScript and returns its stdout.
+func runOsascript(script string) (string, error) {
+	cmd := exec.Command("osascript", "-e", script)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
+// ConfirmPull shows a two-button confirmation for a batch pull. It returns true
+// only when the user explicitly chooses Pull; a dismissed dialog is a Skip.
+func ConfirmPull(message string) (bool, error) {
+	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent" buttons {"Skip", "Pull"} default button "Pull" with icon note)`, escapeAppleScript(message))
+	out, err := runOsascript(script)
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(out) == "Pull", nil
+}
+
+// ResolveConflict shows a three-button choice for a conflicted file.
+func ResolveConflict(filename string) (ConflictChoice, error) {
+	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent — Conflict" buttons {"Skip", "Use server", "Keep local"} default button "Skip" with icon caution)`, escapeAppleScript(conflictMessage(filename)))
+	out, err := runOsascript(script)
+	if err != nil {
+		return ConflictSkip, nil
+	}
+	switch strings.TrimSpace(out) {
+	case "Keep local":
+		return ConflictKeepLocal, nil
+	case "Use server":
+		return ConflictUseServer, nil
+	default:
+		return ConflictSkip, nil
+	}
+}
+
+// GameLikelyRunning is a best-effort, macOS reinforcement before a write (never
+// a substitute for the confirmation): it looks for a D2R process and, failing
+// that, for any save touched in the last ~90s (a likely active session).
+// Detection being unavailable returns false — the dialog is the real barrier.
+//
+// before bounds the mtime heuristic to activity that predates the current pull
+// run, so the agent's own in-run writes (mtime >= before) never self-trigger it.
+func GameLikelyRunning(savesDir string, before time.Time) (bool, string) {
+	if exec.Command("pgrep", "-f", "D2R").Run() == nil {
+		return true, "a Diablo II: Resurrected process appears to be running"
+	}
+	if recentlySaved(savesDir, 90*time.Second, before) {
+		return true, "a save changed in the last 90 seconds — a game session may be active"
+	}
+	return false, ""
+}
+
+// recentlySaved reports whether any .d2s/.d2i in dir was modified within the
+// given window but strictly before the given bound (which excludes the agent's
+// own writes during the current pull run).
+func recentlySaved(dir string, within time.Duration, before time.Time) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	cutoff := time.Now().Add(-within)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if ext != ".d2s" && ext != ".d2i" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		mt := info.ModTime()
+		if mt.After(cutoff) && mt.Before(before) {
+			return true
+		}
+	}
+	return false
 }

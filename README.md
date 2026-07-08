@@ -2,12 +2,17 @@
 
 The local **watcher** for [grailward.com](https://grailward.com): a tiny background app (Go)
 that watches your Diablo II: Resurrected save folder and uploads every changed character
-(`.d2s`) and shared stash (`.d2i`) to the platform. Read-only on your saves; no parsing on
-the client — it just sends the raw bytes.
+(`.d2s`) and shared stash (`.d2i`) to the platform. No parsing on the client — it just sends
+the raw bytes.
+
+By default (**push-only**) it never writes to your saves at all: it only reads and uploads.
+An opt-in **two-way** mode can additionally pull newer saves from the server back onto disk —
+but only after you explicitly confirm each write. See [Sync modes](#sync-modes) below.
 
 It runs as a **menu-bar app** (macOS) / **system-tray app** (Windows): a grailward shield
 icon whose color reports state — **gold** = syncing, **grey** = paused, **red** = error —
-with a menu for pause/resume, poll interval, open saves folder, open logs, reset token, quit.
+with a menu for pause/resume, sync mode, pull latest now, poll interval, open saves folder,
+open logs, reset token, quit.
 
 > **This repository is a public, read-only mirror** of the agent's source from the grailward
 > monorepo — published so you can read the exact code and build/run the agent yourself
@@ -22,7 +27,7 @@ with a menu for pause/resume, poll interval, open saves folder, open logs, reset
 
 Every couple of seconds the agent scans the save folder. For each `.d2s`/`.d2i` that changed
 (debounced, so it only sends once the game has finished writing) and passes a cheap header
-integrity check, it sends the raw bytes:
+integrity check, it uploads the raw bytes:
 
 ```
 POST /api/v1/snapshots
@@ -32,8 +37,64 @@ Content-Type: application/json
 { "raw_base64": "…", "sha256": "…", "source_machine": "…", "filename": "…" }
 ```
 
-That's the entire client. No telemetry, no reading anything outside the save folder, and it
-never writes to your saves.
+Uploads are always accepted. `set_current` is an optional field — omitted, the snapshot
+becomes the current save for its slot; sent as `false`, it is stored as a non-current backup
+(used only when resolving a two-way conflict in the server's favor, see below).
+
+**Two-way mode** adds two read endpoints. First a manifest of what the server holds:
+
+```
+GET /api/v1/sync
+Authorization: Bearer <your api token>
+
+{ "characters":     [ { "filename": "…", "sha256": "…", "download_path": "…", … } ],
+  "shared_stashes": [ { "filename": "…", "sha256": "…", "download_path": "…", … } ] }
+```
+
+Then, for a save the agent decides to pull, the raw bytes at the server-provided
+`download_path` (used verbatim, never re-constructed):
+
+```
+GET <download_path>
+Authorization: Bearer <your api token>
+
+200 application/octet-stream   (body = raw save bytes; X-Sha256 header = expected digest)
+```
+
+If the server has pull turned off it answers the manifest with `503 {"error": …}`; the agent
+degrades quietly (a status message, no crash, no aggressive retry). That is the entire client:
+no telemetry, and nothing outside the save folder is ever read.
+
+## Sync modes
+
+The mode is per-device, stored as `sync_mode` in `config.json`, and switchable live from the
+tray menu.
+
+- **`push` (default).** Upload-only. The agent **never** writes to your saves — it only reads
+  and sends changed files. This is the original behavior.
+- **`two_way` (opt-in).** In addition to uploading, the agent offers to pull newer server
+  saves onto disk. Every write is opt-in and confirmed by you; nothing is ever written
+  automatically or silently. On app start, whenever you pick **Pull latest now**, and the
+  moment you switch to two-way from the tray menu, it fetches the manifest and, if the
+  server is ahead:
+  - one batch confirmation for **fast-forwards / new saves** — cases where your local bytes
+    are already in the server's history (or there is no local file at all), so there is
+    nothing to lose;
+  - one three-way prompt **per conflicting file** — *Keep local* (upload yours as current),
+    *Use server* (back yours up to the server first, then download the server's copy), or
+    *Skip*.
+
+  A background check every 5 minutes only **signals** (updates the tray tooltip and the
+  "Pull latest now" label with a count) — it never opens a dialog and never writes.
+
+Before **any** write, and only ever as a reinforcement on top of your confirmation, the agent
+refuses if it detects a running game session. Every write also: backs up the file it is about
+to overwrite (to a `backups/` folder beside the config), verifies the downloaded bytes'
+sha256 against both the manifest and the `X-Sha256` header, and writes atomically (temp file
++ rename in the same folder). It never deletes a local save and never writes outside the
+saves folder. For the *Use server* conflict path, your local bytes are guaranteed onto the
+server before anything is overwritten (fast-forwards need no such upload — they are already
+in the server's history by definition).
 
 ## Layout
 
@@ -41,10 +102,13 @@ never writes to your saves.
 |---|---|
 | `main.go` | Entry point: loads config, tees logs to `agent.log`, hands the main thread to the tray. |
 | `tray.go` | Menu-bar UI (`fyne.io/systray`) + embedded icons; the watcher runs in a goroutine. |
-| `watcher.go` | Poll loop, debounce, `.d2s`/`.d2i` validation, upload, per-file log de-dup. |
-| `client.go` | HTTP client for `POST /api/v1/snapshots`. |
+| `watcher.go` | Poll loop, debounce, `.d2s`/`.d2i` validation, upload, per-file log de-dup, pull scheduling. |
+| `pull.go` | Two-way orchestration: manifest evaluation, confirmations, downloads, conflict resolution. |
+| `sync.go` | Manifest types, the decision matrix, filename sanitization, atomic verified write + backup. |
+| `sync_state.go` | Persistent per-file "last confirmed sync" sha (`sync_state.json`). |
+| `client.go` | HTTP client for `POST /api/v1/snapshots`, `GET /api/v1/sync`, and downloads. |
 | `config.go` | Config load/save (`~/…/grailward-agent/config.json`), CLI flags, token helpers. |
-| `platform_darwin.go` / `platform_windows.go` | Native dialogs (token / folder), open-path. |
+| `platform_darwin.go` / `platform_windows.go` | Native dialogs (token / folder / confirm / conflict), game-running check, open-path. |
 | `icons/` | Tray icons (gold/grey/red), embedded via `go:embed`. |
 | `build.sh` | Cross-platform build → `build/`. |
 

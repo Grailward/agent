@@ -2,7 +2,9 @@ package main
 
 import (
 	_ "embed"
+	"fmt"
 	"log"
+	"strings"
 
 	"fyne.io/systray"
 )
@@ -32,9 +34,12 @@ type tray struct {
 	watcher *Watcher
 	client  *Client
 
-	mToggle   *systray.MenuItem
-	mResetTok *systray.MenuItem
-	mPolls    []*systray.MenuItem
+	mToggle     *systray.MenuItem
+	mResetTok   *systray.MenuItem
+	mPolls      []*systray.MenuItem
+	mPull       *systray.MenuItem
+	mModePush   *systray.MenuItem
+	mModeTwoWay *systray.MenuItem
 }
 
 // RunTray takes over the main thread and runs the menu-bar UI. The watcher
@@ -57,6 +62,19 @@ func (t *tray) onReady() {
 		t.mPolls = append(t.mPolls, item)
 	}
 
+	// Sync mode selector (radio). Push-only never writes to disk; two-way
+	// additionally offers to pull newer server saves, always with confirmation.
+	mMode := systray.AddMenuItem("Sync mode", "Choose how saves are reconciled")
+	twoWay := t.watcher.SyncMode() == SyncModeTwoWay
+	t.mModePush = mMode.AddSubMenuItemCheckbox("Push only", "Only upload local changes; never write to disk", !twoWay)
+	t.mModeTwoWay = mMode.AddSubMenuItemCheckbox("Two-way", "Also offer to pull newer server saves (with confirmation)", twoWay)
+
+	// On-demand pull; only meaningful (and shown) in two-way mode.
+	t.mPull = systray.AddMenuItem("Pull latest now", "Check the server for newer saves and pull them")
+	if !twoWay {
+		t.mPull.Hide()
+	}
+
 	systray.AddSeparator()
 	mOpen := systray.AddMenuItem("Open saves folder", "Reveal the watched folder")
 	mLogs := systray.AddMenuItem("Open logs", "Open the agent log file")
@@ -64,8 +82,9 @@ func (t *tray) onReady() {
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Stop the agent")
 
-	// Wire the watcher's status into the tray, then start polling.
+	// Wire the watcher's status + newer-count into the tray, then start polling.
 	t.watcher.SetStatusFunc(t.render)
+	t.watcher.SetNewerFunc(t.renderNewer)
 	go t.watcher.Start()
 
 	// Event loop: systray channels fire on menu clicks.
@@ -74,6 +93,12 @@ func (t *tray) onReady() {
 			select {
 			case <-t.mToggle.ClickedCh:
 				t.watcher.SetPaused(!t.watcher.Paused())
+			case <-t.mPull.ClickedCh:
+				t.watcher.RequestPull()
+			case <-t.mModePush.ClickedCh:
+				t.setMode(SyncModePush)
+			case <-t.mModeTwoWay.ClickedCh:
+				t.setMode(SyncModeTwoWay)
 			case <-mOpen.ClickedCh:
 				if err := OpenPath(t.watcher.Config.SavesDir); err != nil {
 					log.Printf("Could not open saves folder: %v", err)
@@ -121,6 +146,34 @@ func (t *tray) render(state State, message string) {
 	systray.SetTooltip("Grailward Agent — " + message)
 }
 
+// renderNewer updates the "Pull latest now" label with the count of newer
+// server saves. Runs on the watcher goroutine; systray setters are safe there.
+func (t *tray) renderNewer(count int) {
+	if t.mPull == nil {
+		return
+	}
+	if count > 0 {
+		t.mPull.SetTitle(fmt.Sprintf("Pull latest now (%d newer)", count))
+	} else {
+		t.mPull.SetTitle("Pull latest now")
+	}
+}
+
+// setMode switches the sync mode, updates the radio checks and the visibility
+// of the pull item.
+func (t *tray) setMode(mode string) {
+	t.watcher.SetSyncMode(mode)
+	if mode == SyncModeTwoWay {
+		t.mModeTwoWay.Check()
+		t.mModePush.Uncheck()
+		t.mPull.Show()
+	} else {
+		t.mModePush.Check()
+		t.mModeTwoWay.Uncheck()
+		t.mPull.Hide()
+	}
+}
+
 func (t *tray) syncPollChecks(active int) {
 	for i, item := range t.mPolls {
 		if i == active {
@@ -131,17 +184,20 @@ func (t *tray) syncPollChecks(active int) {
 	}
 }
 
-// resetToken clears the stored token, prompts for a new one and rewires the
-// client. On cancel the old token stays in place.
+// resetToken prompts for a new token, persists it (serialized with the other
+// preference writes), and rewires the live client. On cancel the old token
+// stays in place.
 func (t *tray) resetToken() {
-	token, err := PromptAndSaveToken(t.watcher.Config)
+	token, err := PromptToken(t.watcher.Config.URL)
 	if err != nil {
 		log.Printf("Token reset failed: %v", err)
 		return
 	}
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return // cancelled
 	}
+	t.watcher.SetToken(token)
 	t.client.SetToken(token)
 	log.Println("Token updated via tray")
 	t.render(StateSyncing, "Token updated")
