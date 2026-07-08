@@ -62,7 +62,7 @@ func (w *Watcher) recordSync(filename, sha string) {
 // localSHA reads a file in the saves folder and returns its sha256, or
 // ("", false) when the file is absent/unreadable.
 func (w *Watcher) localSHA(filename string) (string, bool) {
-	data, err := os.ReadFile(filepath.Join(w.Config.SavesDir, filename))
+	data, err := os.ReadFile(filepath.Join(w.SavesDir(), filename))
 	if err != nil {
 		return "", false
 	}
@@ -243,7 +243,7 @@ func (w *Watcher) applyCandidate(c candidate, before time.Time) {
 		w.status(StateError, c.filename+": download failed")
 		return
 	}
-	if err := pullWrite(w.Config.SavesDir, w.backupsDir(), c.filename, data, c.entry.SHA256, xsha); err != nil {
+	if err := pullWrite(w.SavesDir(), w.backupsDir(), c.filename, data, c.entry.SHA256, xsha); err != nil {
 		w.logOnce(c.filename, c.filename+": pull aborted — "+err.Error())
 		w.status(StateError, c.filename+": pull aborted")
 		return
@@ -260,7 +260,7 @@ func (w *Watcher) useServer(c candidate, before time.Time) {
 	if !w.guardAllowsWrite(before) {
 		return
 	}
-	dest := filepath.Join(w.Config.SavesDir, c.filename)
+	dest := filepath.Join(w.SavesDir(), c.filename)
 	localBytes, err := os.ReadFile(dest)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": cannot read local file to back up — "+err.Error())
@@ -289,7 +289,7 @@ func (w *Watcher) useServer(c candidate, before time.Time) {
 // pushLocalNow resolves a conflict in the local copy's favor by uploading it as
 // the current save. No disk write occurs, so no game-open guard is needed.
 func (w *Watcher) pushLocalNow(c candidate) {
-	dest := filepath.Join(w.Config.SavesDir, c.filename)
+	dest := filepath.Join(w.SavesDir(), c.filename)
 	data, err := os.ReadFile(dest)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": cannot read local file to push — "+err.Error())
@@ -303,7 +303,7 @@ func (w *Watcher) pushLocalNow(c candidate) {
 // recordPulled updates the sync state and the watcher's own maps after a
 // successful pull-write, so the next scan does not re-upload what we just wrote.
 func (w *Watcher) recordPulled(filename, sha string) {
-	dest := filepath.Join(w.Config.SavesDir, filename)
+	dest := filepath.Join(w.SavesDir(), filename)
 	if info, err := os.Stat(dest); err == nil {
 		w.Pending[dest] = FileStat{Mtime: info.ModTime(), Size: info.Size()}
 	}
@@ -316,7 +316,7 @@ func (w *Watcher) recordPulled(filename, sha string) {
 // bounds the mtime heuristic to activity that predates this pull run.
 func (w *Watcher) guardAllowsWrite(before time.Time) bool {
 	w.ensureSeams()
-	if running, reason := w.gameRunning(w.Config.SavesDir, before); running {
+	if running, reason := w.gameRunning(w.SavesDir(), before); running {
 		log.Printf("Refusing to write: %s. Close Diablo II: Resurrected and try again.", reason)
 		w.status(StateError, "Game open — write refused")
 		return false

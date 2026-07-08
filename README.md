@@ -11,8 +11,9 @@ but only after you explicitly confirm each write. See [Sync modes](#sync-modes) 
 
 It runs as a **menu-bar app** (macOS) / **system-tray app** (Windows): a grailward shield
 icon whose color reports state — **gold** = syncing, **grey** = paused, **red** = error —
-with a menu for pause/resume, sync mode, pull latest now, poll interval, open saves folder,
-open logs, about (version and configuration details), reset token, quit.
+with a menu for pause/resume, sync mode, pull latest now, poll interval, a Saves folder
+submenu (open the watched folder or change to a different one), open logs, about (version
+and configuration details), reset token, quit.
 
 > **This repository is a public, read-only mirror** of the agent's source from the grailward
 > monorepo — published so you can read the exact code and build/run the agent yourself
@@ -109,7 +110,8 @@ in the server's history by definition).
 | `client.go` | HTTP client for `POST /api/v1/snapshots`, `GET /api/v1/sync`, and downloads. |
 | `config.go` | Config load/save (`~/…/grailward-agent/config.json`), CLI flags, token helpers. |
 | `platform_darwin.go` / `platform_windows.go` | Native dialogs (token / folder / confirm / conflict), game-running check, open-path. |
-| `icons/` | Tray icons (gold/grey/red), embedded via `go:embed`. |
+| `icons/` | Tray icons (gold/grey/red), embedded via `go:embed`, plus `app.png` (the file/bundle icon art). |
+| `tools/mkico/` | Build-time helper: packs PNGs into a multi-size `.ico` for the Windows resource. |
 | `build.sh` | Cross-platform build → `build/`. |
 
 ## Build it yourself
@@ -126,8 +128,11 @@ Because the tray needs **CGO** (Cocoa on macOS, Win32 on Windows), the old pure-
   then zipped to `grailward-agent-macos.zip` (the `.app` is a folder, so a single-file
   download has to be the zip).
 - **Windows** requires a **mingw-w64** cross toolchain (`brew install mingw-w64`) and
-  builds with `-H windowsgui` (no console window). Without mingw, `build.sh` skips the
-  Windows target and prints a warning — it does not fail.
+  builds with `-H windowsgui` (no console window). The app icon and version metadata are
+  embedded as a PE resource: `mkico` (`tools/mkico`) packs the icon into a multi-size
+  `.ico`, and `windres` compiles it into the `.exe`. Without mingw, `build.sh` skips the
+  Windows target and prints a warning — it does not fail; without `windres` it builds a
+  resource-less `.exe`.
 
 ## Runtime config & CLI flags
 

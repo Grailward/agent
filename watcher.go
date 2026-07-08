@@ -53,6 +53,7 @@ type Watcher struct {
 	newerCount int
 	reset      chan struct{} // wakes the loop when interval/pause changes
 	pullReq    chan struct{} // requests an interactive pull on the scan goroutine
+	changeDir  chan string   // requests a live saves-folder swap on the scan goroutine
 	onStatus   StatusFunc
 	onNewer    NewerFunc
 
@@ -85,6 +86,7 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 		interval:        time.Duration(cfg.PollInterval * float64(time.Second)),
 		reset:           make(chan struct{}, 1),
 		pullReq:         make(chan struct{}, 1),
+		changeDir:       make(chan string, 1),
 		confirmPull:     ConfirmPull,
 		resolveConflict: ResolveConflict,
 		gameRunning:     GameLikelyRunning,
@@ -138,6 +140,15 @@ func (w *Watcher) SyncMode() string {
 	return SyncModePush
 }
 
+// SavesDir returns the folder currently being watched. It is read under w.mu
+// because the tray can read it (Open folder, About, the Change folder default)
+// while the scan goroutine swaps it live via applyDirChange.
+func (w *Watcher) SavesDir() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Config.SavesDir
+}
+
 // SetSyncMode switches sync mode live and persists it to config. Switching to
 // two-way requests an immediate pull check; switching to push clears any
 // pending newer-count badge.
@@ -164,6 +175,16 @@ func (w *Watcher) RequestPull() {
 	case w.pullReq <- struct{}{}:
 	default:
 	}
+}
+
+// ChangeSavesDir requests a live switch to a different saves folder. The actual
+// swap runs on the scan goroutine (delivered via the changeDir channel, like
+// pullReq) so it can reset the lock-free scan maps without racing an in-flight
+// scan, and so a pull already in progress finishes writing into the old folder
+// before the re-target takes effect — never into the new one. The buffered
+// channel absorbs the (user-driven, one-at-a-time) request.
+func (w *Watcher) ChangeSavesDir(dir string) {
+	w.changeDir <- dir
 }
 
 // Paused reports whether the sync loop is currently paused.
@@ -258,7 +279,7 @@ func (w *Watcher) Start() {
 	w.mu.Lock()
 	poll := w.Config.PollInterval
 	w.mu.Unlock()
-	log.Printf("Watching directory: %s -> %s (poll interval: %.1fs, mode: %s)", w.Config.SavesDir, w.Config.URL, poll, w.SyncMode())
+	log.Printf("Watching directory: %s -> %s (poll interval: %.1fs, mode: %s)", w.SavesDir(), w.Config.URL, poll, w.SyncMode())
 	w.status(StateSyncing, "Watching for changes")
 
 	w.scanIfActive()
@@ -279,6 +300,11 @@ func (w *Watcher) Start() {
 		case <-w.pullReq:
 			scanTimer.Stop()
 			w.runPull()
+		case dir := <-w.changeDir:
+			scanTimer.Stop()
+			if w.applyDirChange(dir) {
+				w.scanIfActive() // pick up the new folder right away
+			}
 		case <-syncTimer.C:
 			scanTimer.Stop()
 			w.periodicSyncCheck()
@@ -296,11 +322,58 @@ func (w *Watcher) scanIfActive() {
 	w.Scan()
 }
 
+// applyDirChange re-targets the watcher at a new saves folder. It runs on the
+// scan goroutine (delivered via the changeDir channel), so the lock-free scan
+// maps can be reset here without racing an in-flight scan, and a pull opened
+// against the old folder finishes before the swap takes effect. The new path is
+// validated (it must be an existing directory); an invalid or unchanged path is
+// left as a no-op and the current folder is kept. It reports whether the folder
+// actually changed, so the caller can trigger an immediate rescan.
+//
+// The maps are keyed by absolute path under the OLD folder — those entries will
+// never be seen again, so they are cleared; a same-named file in the NEW folder
+// then goes through debounce + upload from scratch. sync_state (keyed by
+// basename) is deliberately left intact: the sha decision matrix will treat a
+// same-named but divergent file in the new folder as a conflict, never a clobber.
+func (w *Watcher) applyDirChange(dir string) bool {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return false
+	}
+	old := w.SavesDir()
+	if filepath.Clean(dir) == filepath.Clean(old) {
+		return false // same folder, nothing to do
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		log.Printf("Ignoring saves folder change: %q is not an accessible directory: %v", dir, err)
+		return false
+	}
+
+	w.mu.Lock()
+	w.Config.SavesDir = dir
+	w.mu.Unlock()
+
+	clear(w.Pending)
+	clear(w.Uploaded)
+	clear(w.lastLine)
+
+	log.Printf("Saves folder changed: %s -> %s", old, dir)
+	w.persistConfig()
+
+	w.setNewer(0) // the old folder's newer-count is meaningless for the new one
+	w.status(StateSyncing, "Saves folder changed")
+	return true
+}
+
 // Scan performs a single directory scan.
 func (w *Watcher) Scan() {
-	entries, err := os.ReadDir(w.Config.SavesDir)
+	// Snapshot the target once so the whole scan sees a single consistent folder
+	// even if a change lands between iterations of the outer loop.
+	savesDir := w.SavesDir()
+	entries, err := os.ReadDir(savesDir)
 	if err != nil {
-		log.Printf("Error reading saves directory %s: %v", w.Config.SavesDir, err)
+		log.Printf("Error reading saves directory %s: %v", savesDir, err)
 		w.status(StateError, "Cannot read saves folder")
 		return
 	}
@@ -315,7 +388,7 @@ func (w *Watcher) Scan() {
 			continue
 		}
 
-		path := filepath.Join(w.Config.SavesDir, entry.Name())
+		path := filepath.Join(savesDir, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
 			continue

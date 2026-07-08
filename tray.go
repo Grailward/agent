@@ -69,11 +69,14 @@ func (t *tray) onReady() {
 	}
 
 	systray.AddSeparator()
-	mOpen := systray.AddMenuItem("Open saves folder", "Reveal the watched folder")
+	// Saves folder submenu: open the watched folder, or switch to a different one.
+	mSaves := systray.AddMenuItem("Saves folder", "The folder the agent watches")
+	mOpenFolder := mSaves.AddSubMenuItem("Open folder", "Reveal the watched folder")
+	mChangeFolder := mSaves.AddSubMenuItem("Change folder", "Watch a different saves folder")
 	mLogs := systray.AddMenuItem("Open logs", "Open the agent log file")
-	mAbout := systray.AddMenuItem("About Grailward Agent", "Version and configuration details")
 	systray.AddSeparator()
-	t.mResetTok = systray.AddMenuItem("Reset token…", "Clear the stored token and enter a new one")
+	t.mResetTok = systray.AddMenuItem("Reset token", "Clear the stored token and enter a new one")
+	mAbout := systray.AddMenuItem("About Grailward Agent", "Version and configuration details")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Stop the agent")
 
@@ -94,10 +97,12 @@ func (t *tray) onReady() {
 				t.setMode(SyncModePush)
 			case <-t.mModeTwoWay.ClickedCh:
 				t.setMode(SyncModeTwoWay)
-			case <-mOpen.ClickedCh:
-				if err := OpenPath(t.watcher.Config.SavesDir); err != nil {
+			case <-mOpenFolder.ClickedCh:
+				if err := OpenPath(t.watcher.SavesDir()); err != nil {
 					log.Printf("Could not open saves folder: %v", err)
 				}
+			case <-mChangeFolder.ClickedCh:
+				t.changeSavesDir()
 			case <-mLogs.ClickedCh:
 				if path, err := LogPath(); err == nil {
 					if err := OpenPath(path); err != nil {
@@ -150,7 +155,7 @@ func (t *tray) showAbout() {
 	if err != nil {
 		configDir = "(unknown)"
 	}
-	msg := aboutText(Version, t.watcher.Config.URL, t.watcher.Config.SavesDir, t.watcher.SyncMode(), configDir)
+	msg := aboutText(Version, t.watcher.Config.URL, t.watcher.SavesDir(), t.watcher.SyncMode(), configDir)
 	if err := ShowAbout(msg); err != nil {
 		log.Printf("Could not show About dialog: %v", err)
 	}
@@ -210,6 +215,23 @@ func (t *tray) syncPollChecks(active int) {
 			item.Uncheck()
 		}
 	}
+}
+
+// changeSavesDir opens the native folder picker (defaulting to the current
+// folder) and hands the choice to the watcher, which validates and re-targets
+// live on its own goroutine. A cancelled/empty pick is a no-op. This runs on the
+// tray event goroutine, like resetToken, so the blocking picker holds up only
+// the menu — never the scan loop.
+func (t *tray) changeSavesDir() {
+	dir, err := PromptSavesDir(t.watcher.SavesDir())
+	if err != nil {
+		log.Printf("Saves folder picker failed: %v", err)
+		return
+	}
+	if strings.TrimSpace(dir) == "" {
+		return // cancelled
+	}
+	t.watcher.ChangeSavesDir(dir)
 }
 
 // resetToken prompts for a new token, persists it (serialized with the other
