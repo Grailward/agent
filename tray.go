@@ -1,7 +1,6 @@
 package main
 
 import (
-	_ "embed"
 	"fmt"
 	"log"
 	"strings"
@@ -9,14 +8,8 @@ import (
 	"fyne.io/systray"
 )
 
-//go:embed icons/syncing.png
-var iconSyncing []byte
-
-//go:embed icons/paused.png
-var iconPaused []byte
-
-//go:embed icons/error.png
-var iconError []byte
+// Tray icon bytes (iconSyncing, iconPaused, iconError) are defined in icon.go,
+// which encodes them per platform (raw PNG on macOS, ICO on Windows).
 
 // pollPresets are the poll intervals offered in the tray submenu.
 var pollPresets = []struct {
@@ -51,7 +44,7 @@ func RunTray(w *Watcher, c *Client) {
 
 func (t *tray) onReady() {
 	systray.SetTitle("")
-	systray.SetTooltip("Grailward Agent")
+	systray.SetTooltip("Grailward Agent " + Version)
 
 	t.mToggle = systray.AddMenuItem("Pause sync", "Pause or resume watching for save changes")
 
@@ -78,6 +71,8 @@ func (t *tray) onReady() {
 	systray.AddSeparator()
 	mOpen := systray.AddMenuItem("Open saves folder", "Reveal the watched folder")
 	mLogs := systray.AddMenuItem("Open logs", "Open the agent log file")
+	mAbout := systray.AddMenuItem("About Grailward Agent", "Version and configuration details")
+	systray.AddSeparator()
 	t.mResetTok = systray.AddMenuItem("Reset token…", "Clear the stored token and enter a new one")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Stop the agent")
@@ -109,6 +104,8 @@ func (t *tray) onReady() {
 						log.Printf("Could not open logs: %v", err)
 					}
 				}
+			case <-mAbout.ClickedCh:
+				t.showAbout()
 			case <-t.mResetTok.ClickedCh:
 				t.resetToken()
 			case <-mQuit.ClickedCh:
@@ -143,7 +140,38 @@ func (t *tray) render(state State, message string) {
 		systray.SetIcon(iconSyncing)
 		t.mToggle.SetTitle("Pause sync")
 	}
-	systray.SetTooltip("Grailward Agent — " + message)
+	systray.SetTooltip(fmt.Sprintf("Grailward Agent %s — %s", Version, message))
+}
+
+// showAbout builds the About panel text from the live config and shows it in a
+// native OK dialog (osascript on macOS, a PowerShell MessageBox on Windows).
+func (t *tray) showAbout() {
+	configDir, err := ConfigDir()
+	if err != nil {
+		configDir = "(unknown)"
+	}
+	msg := aboutText(Version, t.watcher.Config.URL, t.watcher.Config.SavesDir, t.watcher.SyncMode(), configDir)
+	if err := ShowAbout(msg); err != nil {
+		log.Printf("Could not show About dialog: %v", err)
+	}
+}
+
+// aboutText renders the About panel body. Pure (no I/O) so it is unit-testable;
+// the version already carries its own "v" prefix on release builds ("dev"
+// locally). The trailing line is a required unaffiliated-fan-tool disclaimer.
+func aboutText(version, serverURL, savesDir, syncMode, configDir string) string {
+	mode := "Push only"
+	if syncMode == SyncModeTwoWay {
+		mode = "Two-way"
+	}
+	return fmt.Sprintf(
+		"Grailward Agent %s\n"+
+			"Server: %s\n"+
+			"Saves folder: %s\n"+
+			"Sync mode: %s\n"+
+			"Config & logs: %s\n\n"+
+			"Unofficial fan-made tool — not affiliated with Blizzard Entertainment.",
+		version, serverURL, savesDir, mode, configDir)
 }
 
 // renderNewer updates the "Pull latest now" label with the count of newer

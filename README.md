@@ -12,7 +12,7 @@ but only after you explicitly confirm each write. See [Sync modes](#sync-modes) 
 It runs as a **menu-bar app** (macOS) / **system-tray app** (Windows): a grailward shield
 icon whose color reports state — **gold** = syncing, **grey** = paused, **red** = error —
 with a menu for pause/resume, sync mode, pull latest now, poll interval, open saves folder,
-open logs, reset token, quit.
+open logs, about (version and configuration details), reset token, quit.
 
 > **This repository is a public, read-only mirror** of the agent's source from the grailward
 > monorepo — published so you can read the exact code and build/run the agent yourself

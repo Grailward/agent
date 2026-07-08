@@ -88,6 +88,17 @@ func runPowerShell(script string, env ...string) (string, error) {
 	return out.String(), nil
 }
 
+// ShowAbout displays a simple informational MessageBox with a single OK button.
+// The message text is passed via env to avoid quoting issues in the script body.
+func ShowAbout(message string) error {
+	script := `
+Add-Type -AssemblyName System.Windows.Forms
+[void][System.Windows.Forms.MessageBox]::Show($env:GW_MSG, "Grailward Agent", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+`
+	_, err := runPowerShell(script, "GW_MSG="+message)
+	return err
+}
+
 // ConfirmPull shows a two-button confirmation for a batch pull (OK = Pull,
 // Cancel = Skip). Returns true only when the user chooses Pull.
 func ConfirmPull(message string) (bool, error) {

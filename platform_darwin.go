@@ -85,6 +85,13 @@ func runOsascript(script string) (string, error) {
 	return out.String(), nil
 }
 
+// ShowAbout displays a simple informational dialog with a single OK button.
+func ShowAbout(message string) error {
+	script := fmt.Sprintf(`display dialog "%s" with title "Grailward Agent" buttons {"OK"} default button "OK" with icon note`, escapeAppleScript(message))
+	_, err := runOsascript(script)
+	return err
+}
+
 // ConfirmPull shows a two-button confirmation for a batch pull. It returns true
 // only when the user explicitly chooses Pull; a dismissed dialog is a Skip.
 func ConfirmPull(message string) (bool, error) {
