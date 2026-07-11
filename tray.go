@@ -33,6 +33,7 @@ type tray struct {
 	mPull       *systray.MenuItem
 	mModePush   *systray.MenuItem
 	mModeTwoWay *systray.MenuItem
+	mMapSync    *systray.MenuItem
 }
 
 // RunTray takes over the main thread and runs the menu-bar UI. The watcher
@@ -61,6 +62,12 @@ func (t *tray) onReady() {
 	twoWay := t.watcher.SyncMode() == SyncModeTwoWay
 	t.mModePush = mMode.AddSubMenuItemCheckbox("Push only", "Only upload local changes; never write to disk", !twoWay)
 	t.mModeTwoWay = mMode.AddSubMenuItemCheckbox("Two-way", "Also offer to pull newer server saves (with confirmation)", twoWay)
+
+	// Map-exploration sidecar sync (default ON): carry each character's
+	// explored-map files (fog of war) across machines alongside the save.
+	t.mMapSync = systray.AddMenuItemCheckbox("Sync map exploration",
+		"Also sync each character's explored-map files across machines",
+		t.watcher.MapSyncEnabled())
 
 	// On-demand pull; only meaningful (and shown) in two-way mode.
 	t.mPull = systray.AddMenuItem("Pull latest now", "Check the server for newer saves and pull them")
@@ -97,6 +104,8 @@ func (t *tray) onReady() {
 				t.setMode(SyncModePush)
 			case <-t.mModeTwoWay.ClickedCh:
 				t.setMode(SyncModeTwoWay)
+			case <-t.mMapSync.ClickedCh:
+				t.toggleMapSync()
 			case <-mOpenFolder.ClickedCh:
 				if err := OpenPath(t.watcher.SavesDir()); err != nil {
 					log.Printf("Could not open saves folder: %v", err)
@@ -204,6 +213,18 @@ func (t *tray) setMode(mode string) {
 		t.mModePush.Check()
 		t.mModeTwoWay.Uncheck()
 		t.mPull.Hide()
+	}
+}
+
+// toggleMapSync flips the map-exploration sidecar sync, persists it via the
+// watcher, and reflects the new state on the checkbox.
+func (t *tray) toggleMapSync() {
+	on := !t.mMapSync.Checked()
+	t.watcher.SetMapSync(on)
+	if on {
+		t.mMapSync.Check()
+	} else {
+		t.mMapSync.Uncheck()
 	}
 }
 

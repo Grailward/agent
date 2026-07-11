@@ -31,6 +31,19 @@ type ManifestEntry struct {
 	SourceMachine string  `json:"source_machine"`
 	HeldBy        *string `json:"held_by"`
 	DownloadPath  string  `json:"download_path"`
+	// Sidecars lists the map-exploration files that travel with a character save
+	// (characters only; shared-stash entries never carry these). Both fields are
+	// decoded tolerantly: absent on an entry means a zero value (no sidecars).
+	Sidecars             []SidecarMeta `json:"sidecars"`
+	SidecarsDownloadPath string        `json:"sidecars_download_path"`
+}
+
+// SidecarMeta describes one map-exploration sidecar file as listed in the
+// manifest, so the pull can decide which sidecars differ from the local copies.
+type SidecarMeta struct {
+	Filename string `json:"filename"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
 }
 
 // entries flattens characters and shared stashes into one list for the
@@ -63,6 +76,11 @@ const (
 	// DecisionPushLocal — local changed but the server has not moved. The normal
 	// upload path (the scan loop) already handles this; the pull does nothing.
 	DecisionPushLocal
+	// DecisionSidecarOnly — the character save itself is in sync, but at least one
+	// map-exploration sidecar differs (or is missing) locally. It is applied
+	// silently on a pull (server wins, no confirmation) and never counts toward
+	// the "newer saves" badge.
+	DecisionSidecarOnly
 )
 
 // decide classifies one file from the sync matrix. localSHA is empty when the
@@ -94,48 +112,82 @@ func decide(localPresent bool, localSHA, lastSyncSHA, serverSHA string) SyncDeci
 	return DecisionConflict
 }
 
-// sanitizeFilename treats the manifest filename as hostile input. It returns the
-// safe basename and true only when the name has no path separators, no control
-// characters, no traversal, is not a dotfile, is not a Windows reserved device
-// name, and carries a .d2s or .d2i extension.
-func sanitizeFilename(name string) (string, bool) {
+// safeBasename runs the extension-independent hostile-input checks shared by the
+// save and sidecar sanitizers. It returns true only when the name has no control
+// characters (NUL included), no path separators, is an idempotent bare basename,
+// is not a dotfile (which also rejects "." and ".."), and is not a Windows
+// reserved device name (matched on the segment before the first dot, since
+// Windows treats "CON.map" as the CON device, not a file).
+func safeBasename(name string) bool {
 	if name == "" {
-		return "", false
+		return false
 	}
-	// Reject control characters (which include NUL) — never valid in a filename
-	// and a common smuggling vector.
 	for _, r := range name {
 		if r < 0x20 || r == 0x7f {
-			return "", false
+			return false
 		}
 	}
-	// No separators, either platform, before any path use.
 	if strings.ContainsAny(name, `/\`) {
-		return "", false
+		return false
 	}
-	// filepath.Base must be idempotent on a bare filename.
 	if name != filepath.Base(name) {
-		return "", false
+		return false
 	}
-	// Rejects ".", "..", and any dotfile (hidden / traversal).
 	if strings.HasPrefix(name, ".") {
+		return false
+	}
+	stem := name
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		stem = name[:i]
+	}
+	return !isReservedDeviceName(stem)
+}
+
+// sanitizeFilename treats the manifest filename as hostile input. It returns the
+// safe basename and true only when it passes the shared hostile-input checks and
+// carries a .d2s or .d2i extension.
+func sanitizeFilename(name string) (string, bool) {
+	if !safeBasename(name) {
 		return "", false
 	}
 	ext := strings.ToLower(filepath.Ext(name))
 	if ext != ".d2s" && ext != ".d2i" {
 		return "", false
 	}
-	// Reject Windows reserved device names (CON, NUL, COM1…), matched on the
-	// segment before the first dot, case-insensitively — Windows treats
-	// "CON.d2s" as the CON device, not a file.
-	stem := name
-	if i := strings.IndexByte(name, '.'); i >= 0 {
-		stem = name[:i]
+	return name, true
+}
+
+// sanitizeSidecarFilename treats a sidecar filename from the server as hostile.
+// On top of the shared hostile-input checks it requires a map-exploration
+// extension (.map or .ma<single digit>, case-insensitive) and — crucially — that
+// the whole name is exactly base + that extension, i.e. the sidecar belongs to
+// the character whose .d2s the pull just handled. Anything with an extra segment
+// (e.g. "Hero.foo.map"), a different stem, or a two-digit .maNN is rejected.
+func sanitizeSidecarFilename(name, base string) (string, bool) {
+	if !safeBasename(name) {
+		return "", false
 	}
-	if isReservedDeviceName(stem) {
+	ext := filepath.Ext(name)
+	if !validSidecarExt(ext) {
+		return "", false
+	}
+	if name[:len(name)-len(ext)] != base {
 		return "", false
 	}
 	return name, true
+}
+
+// validSidecarExt reports whether ext (with the leading dot) is a map-exploration
+// sidecar extension: ".map" or ".ma<one digit>", compared case-insensitively.
+func validSidecarExt(ext string) bool {
+	e := strings.ToLower(ext)
+	if e == ".map" {
+		return true
+	}
+	if len(e) == 4 && strings.HasPrefix(e, ".ma") {
+		return e[3] >= '0' && e[3] <= '9'
+	}
+	return false
 }
 
 // isReservedDeviceName reports whether s is a Windows reserved device name
@@ -162,23 +214,41 @@ func pullWrite(savesDir, backupsDir, filename string, data []byte, manifestSHA, 
 	if !ok {
 		return fmt.Errorf("rejected unsafe filename %q", filename)
 	}
+	if err := verifySHA(clean, data, manifestSHA, headerSHA); err != nil {
+		return err
+	}
+	return writeAtomic(savesDir, backupsDir, clean, data)
+}
 
+// verifySHA checks the sha256 of data against every non-empty expected digest
+// (the manifest sha, the X-Sha256 header, the batch JSON sha…). An empty
+// expected value is skipped, so callers can pass an optional header sha as "".
+func verifySHA(clean string, data []byte, expected ...string) error {
 	sum := sha256.Sum256(data)
 	got := hex.EncodeToString(sum[:])
-	if !strings.EqualFold(got, manifestSHA) {
-		return fmt.Errorf("sha mismatch for %s: downloaded %s != manifest %s", clean, got, manifestSHA)
+	for _, exp := range expected {
+		if exp == "" {
+			continue
+		}
+		if !strings.EqualFold(got, exp) {
+			return fmt.Errorf("sha mismatch for %s: got %s != expected %s", clean, got, exp)
+		}
 	}
-	if headerSHA != "" && !strings.EqualFold(got, headerSHA) {
-		return fmt.Errorf("sha mismatch for %s: downloaded %s != X-Sha256 %s", clean, got, headerSHA)
-	}
+	return nil
+}
 
-	dest := filepath.Join(savesDir, clean)
+// writeAtomic writes pre-sanitized, pre-verified bytes for cleanName into
+// savesDir, backing up any existing file first, then temp-file + fsync + rename.
+// cleanName MUST already be a sanitized basename and data MUST already be
+// sha-verified by the caller. It never deletes and never writes outside savesDir.
+func writeAtomic(savesDir, backupsDir, cleanName string, data []byte) error {
+	dest := filepath.Join(savesDir, cleanName)
 
 	// Back up any existing file before overwriting it (one backup per filename,
 	// overwriting the previous one).
 	if _, err := os.Stat(dest); err == nil {
-		if err := backupFile(dest, backupsDir, clean); err != nil {
-			return fmt.Errorf("backup of %s failed: %w", clean, err)
+		if err := backupFile(dest, backupsDir, cleanName); err != nil {
+			return fmt.Errorf("backup of %s failed: %w", cleanName, err)
 		}
 	}
 

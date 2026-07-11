@@ -110,6 +110,53 @@ func TestSanitizeFilename(t *testing.T) {
 	}
 }
 
+func TestSanitizeSidecarFilename(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		base   string
+		want   string
+		wantOK bool
+	}{
+		{"map", "Mira.map", "Mira", "Mira.map", true},
+		{"ma0", "Mira.ma0", "Mira", "Mira.ma0", true},
+		{"ma4", "Mira.ma4", "Mira", "Mira.ma4", true},
+		{"ma9", "Mira.ma9", "Mira", "Mira.ma9", true},
+		{"uppercase map ext", "Mira.MAP", "Mira", "Mira.MAP", true},
+		{"uppercase ma ext", "Mira.MA0", "Mira", "Mira.MA0", true},
+		// Two-digit map index is not a valid sidecar extension.
+		{"two digit index", "Mira.ma10", "Mira", "", false},
+		// .key and .ctl are explicitly out of scope.
+		{"key excluded", "Mira.key", "Mira", "", false},
+		{"ctl excluded", "Mira.ctl", "Mira", "", false},
+		{"d2s is not a sidecar", "Mira.d2s", "Mira", "", false},
+		{"no extension", "Mira", "Mira", "", false},
+		// Stem must match the character base exactly.
+		{"other char stem", "Other.map", "Mira", "", false},
+		{"extra middle segment", "Mira.foo.map", "Mira", "", false},
+		// Hostile-input rejections shared with the save sanitizer.
+		{"traversal", "../Mira.map", "Mira", "", false},
+		{"backslash sep", "sub\\Mira.map", "Mira", "", false},
+		{"forward sep", "sub/Mira.map", "Mira", "", false},
+		{"dotfile", ".Mira.map", "Mira", "", false},
+		{"nul byte", "Mira\x00.map", "Mira", "", false},
+		{"control byte", "Mi\x01ra.map", "Mira", "", false},
+		{"empty", "", "Mira", "", false},
+		// Reserved device name as the base is rejected even with a valid ext.
+		{"reserved base", "CON.map", "CON", "", false},
+		{"reserved base lower", "nul.map", "nul", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := sanitizeSidecarFilename(tt.in, tt.base)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("sanitizeSidecarFilename(%q, %q) = (%q, %v), want (%q, %v)",
+					tt.in, tt.base, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestPullWriteNewFile(t *testing.T) {
 	saves := t.TempDir()
 	backups := t.TempDir()

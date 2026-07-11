@@ -42,6 +42,38 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// SidecarFile is one map-exploration sidecar in a batch upload or download body.
+type SidecarFile struct {
+	Filename  string `json:"filename"`
+	SHA256    string `json:"sha256"`
+	RawBase64 string `json:"raw_base64"`
+}
+
+// SidecarUploadRequest is the PUT body carrying a character's sidecars.
+type SidecarUploadRequest struct {
+	SourceMachine string        `json:"source_machine"`
+	Files         []SidecarFile `json:"files"`
+}
+
+// SidecarUploadResponse is the batch upload result. On a 2xx it carries the
+// per-file statuses; on a rejection Error (and, when the server names it,
+// Filename) is filled in and nothing was persisted.
+type SidecarUploadResponse struct {
+	Status string `json:"status"`
+	Files  []struct {
+		Filename string `json:"filename"`
+		Status   string `json:"status"`
+	} `json:"files"`
+	Error    string `json:"error"`
+	Filename string `json:"filename"`
+}
+
+// SidecarDownloadResponse is the batch download body: every sidecar the server
+// holds for a character, each with its own sha and base64 payload.
+type SidecarDownloadResponse struct {
+	Files []SidecarFile `json:"files"`
+}
+
 // PullDisabledError signals that the server has turned off the pull endpoint
 // (HTTP 503). The agent degrades gracefully instead of treating it as a crash.
 type PullDisabledError struct {
@@ -241,4 +273,87 @@ func (c *Client) Download(downloadPath string) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("download failed: %s", apiErrorMessage(resp.StatusCode, body))
 	}
 	return body, resp.Header.Get("X-Sha256"), nil
+}
+
+// UploadSidecars sends a batch of a character's map-exploration sidecars via
+// PUT /api/v1/characters/<name>/sidecars. charName comes from the server's own
+// upload response (never from hostile input) — note url.JoinPath does NOT
+// escape "/" inside a segment, so it must stay that way. The call is idempotent
+// (unchanged files come back with status "unchanged"); a non-2xx (e.g. a 422
+// rejecting a file) is surfaced via the response Error, with nothing persisted
+// server-side.
+func (c *Client) UploadSidecars(charName string, files []SidecarFile, machine string) (*SidecarUploadResponse, error) {
+	base, err := url.Parse(c.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid API URL: %w", err)
+	}
+	reqURL := base.JoinPath("api", "v1", "characters", charName, "sidecars")
+
+	jsonBytes, err := json.Marshal(SidecarUploadRequest{SourceMachine: machine, Files: files})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal sidecar request: %w", err)
+	}
+	req, err := http.NewRequest("PUT", reqURL.String(), bytes.NewBuffer(jsonBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sidecar request: %w", err)
+	}
+	c.setCommonHeaders(req)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sidecar upload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sidecar response body: %w", err)
+	}
+
+	var out SidecarUploadResponse
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := json.Unmarshal(respBytes, &out); err != nil {
+			return nil, fmt.Errorf("failed to parse sidecar response JSON: %w", err)
+		}
+		return &out, nil
+	}
+	out.Error = apiErrorMessage(resp.StatusCode, respBytes)
+	// Best-effort: surface the offending filename the server named, if any.
+	var perr struct {
+		Filename string `json:"filename"`
+	}
+	if json.Unmarshal(respBytes, &perr) == nil {
+		out.Filename = perr.Filename
+	}
+	return &out, nil
+}
+
+// DownloadSidecars fetches the batch of sidecars for a character at the
+// server-provided path (used verbatim, never re-constructed). The payloads are
+// NOT verified here; the caller checks each file's sha against both the batch
+// JSON sha and the manifest before writing anything.
+func (c *Client) DownloadSidecars(downloadPath string) (*SidecarDownloadResponse, error) {
+	req, err := c.authGet(downloadPath)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sidecar download request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read sidecar download body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("sidecar download failed: %s", apiErrorMessage(resp.StatusCode, body))
+	}
+	var out SidecarDownloadResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("failed to parse sidecar download JSON: %w", err)
+	}
+	return &out, nil
 }

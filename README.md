@@ -11,9 +11,12 @@ but only after you explicitly confirm each write. See [Sync modes](#sync-modes) 
 
 It runs as a **menu-bar app** (macOS) / **system-tray app** (Windows): a grailward shield
 icon whose color reports state — **gold** = syncing, **grey** = paused, **red** = error —
-with a menu for pause/resume, sync mode, pull latest now, poll interval, a Saves folder
-submenu (open the watched folder or change to a different one), open logs, about (version
-and configuration details), reset token, quit.
+with a menu for pause/resume, sync mode, sync map exploration (on/off), pull latest now,
+poll interval, a Saves folder submenu (open the watched folder or change to a different
+one), open logs, about (version and configuration details), reset token, quit.
+
+It also syncs each character's **map exploration** (the fog-of-war "reveal" files
+D2R keeps beside the save) across machines — see [Map exploration sync](#map-exploration-sync).
 
 > **This repository is a public, read-only mirror** of the agent's source from the grailward
 > monorepo — published so you can read the exact code and build/run the agent yourself
@@ -96,6 +99,37 @@ sha256 against both the manifest and the `X-Sha256` header, and writes atomicall
 saves folder. For the *Use server* conflict path, your local bytes are guaranteed onto the
 server before anything is overwritten (fast-forwards need no such upload — they are already
 in the server's history by definition).
+
+## Map exploration sync
+
+D2R stores each character's explored map (fog of war) in sidecar files that share the
+save's base name: `<Name>.map` and `<Name>.ma0`…`.ma4`. The map layout derives from a
+seed inside the `.d2s`, so carrying these files across machines keeps your revealed map in
+step with the character. The **Sync map exploration** tray toggle (on by default) governs
+the whole trail; turn it off and no map file is sent, downloaded, or written.
+
+Reveal files are not a save — losing a slice only re-hides a bit of map — so there is no
+conflict resolution: they simply follow the `.d2s`, **last-writer-wins**. They are pushed
+right after a successful character upload and pulled right after a character is written in
+two-way mode (and, silently, when only the map differs while the save is already in sync).
+The `.key`/`.ctl` files are out of scope. Every map write reuses the same safety rules as a
+save: server filenames are strictly sanitized to `<character>.map` / `<character>.ma<digit>`,
+payloads are SHA-256-verified against both the manifest and the batch body, the previous
+file is backed up first, the write is atomic, and nothing is written while a game session
+looks active. Two endpoints back it:
+
+```
+PUT /api/v1/characters/<name>/sidecars      (batch upload; idempotent)
+{ "source_machine": "…",
+  "files": [ { "filename": "<name>.map", "sha256": "…", "raw_base64": "…" }, … ] }
+
+GET /api/v1/characters/<name>/sidecars       (batch download, path from the manifest)
+{ "files": [ { "filename": "…", "sha256": "…", "raw_base64": "…" }, … ] }
+```
+
+Each character entry in `GET /api/v1/sync` also lists its `sidecars`
+(`filename`/`sha256`/`size`) and a `sidecars_download_path`, so the agent knows which map
+files differ before fetching anything.
 
 ## Layout
 

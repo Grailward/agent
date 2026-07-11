@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -89,6 +90,7 @@ func (w *Watcher) evaluate() ([]candidate, error) {
 	if err != nil {
 		return nil, err
 	}
+	mapSync := w.MapSyncEnabled()
 	var cands []candidate
 	for _, e := range m.entries() {
 		clean, ok := sanitizeFilename(e.Filename)
@@ -104,6 +106,11 @@ func (w *Watcher) evaluate() ([]candidate, error) {
 			if present && lastSync != e.SHA256 {
 				w.recordSync(clean, e.SHA256)
 			}
+			// The save is in sync, but its map sidecars may not be — carry them
+			// silently. Skipped entirely when map sync is off.
+			if mapSync && w.sidecarsDiffer(e, clean) {
+				cands = append(cands, candidate{entry: e, decision: DecisionSidecarOnly, filename: clean})
+			}
 		case DecisionPushLocal:
 			// The scan loop uploads this; nothing for the pull to do.
 		case DecisionFastForward, DecisionNewFromServer:
@@ -113,6 +120,43 @@ func (w *Watcher) evaluate() ([]candidate, error) {
 		}
 	}
 	return cands, nil
+}
+
+// newerCount counts the candidates that represent a newer save on the server —
+// everything except silent sidecar-only carries, which never light up the badge.
+func newerCount(cands []candidate) int {
+	n := 0
+	for _, c := range cands {
+		if c.decision != DecisionSidecarOnly {
+			n++
+		}
+	}
+	return n
+}
+
+// sidecarsDiffer reports whether any map-exploration sidecar the manifest lists
+// for a character is missing locally or differs by sha — i.e. there is a silent
+// sidecar-only pull to do even though the .d2s itself is in sync. Only characters
+// (.d2s) carry sidecars.
+func (w *Watcher) sidecarsDiffer(e ManifestEntry, d2sName string) bool {
+	if e.SidecarsDownloadPath == "" || len(e.Sidecars) == 0 {
+		return false
+	}
+	if !strings.EqualFold(filepath.Ext(d2sName), ".d2s") {
+		return false
+	}
+	base := sidecarBase(d2sName)
+	for _, s := range e.Sidecars {
+		clean, ok := sanitizeSidecarFilename(s.Filename, base)
+		if !ok {
+			continue // an unsafe entry can never drive a write
+		}
+		local, present := w.localSHA(clean)
+		if !present || !strings.EqualFold(local, s.SHA256) {
+			return true
+		}
+	}
+	return false
 }
 
 // periodicSyncCheck runs on the scan goroutine's 5-minute timer. It only
@@ -133,7 +177,7 @@ func (w *Watcher) periodicSyncCheck() {
 		}
 		return
 	}
-	n := len(cands)
+	n := newerCount(cands)
 	w.setNewer(n)
 	if n > 0 {
 		w.status(StateSyncing, fmt.Sprintf("%d newer save(s) on server — use Pull latest now", n))
@@ -144,7 +188,7 @@ func (w *Watcher) periodicSyncCheck() {
 // transient errors (used to update the badge after a pull run).
 func (w *Watcher) refreshNewer() {
 	if cands, err := w.evaluate(); err == nil {
-		w.setNewer(len(cands))
+		w.setNewer(newerCount(cands))
 	}
 }
 
@@ -162,16 +206,19 @@ func (w *Watcher) runPull() {
 		return
 	}
 
-	var batch, conflicts []candidate
+	var batch, conflicts, sidecarOnly []candidate
 	for _, c := range cands {
-		if c.decision == DecisionConflict {
+		switch c.decision {
+		case DecisionConflict:
 			conflicts = append(conflicts, c)
-		} else {
+		case DecisionSidecarOnly:
+			sidecarOnly = append(sidecarOnly, c)
+		default:
 			batch = append(batch, c)
 		}
 	}
 
-	if len(batch) == 0 && len(conflicts) == 0 {
+	if len(batch) == 0 && len(conflicts) == 0 && len(sidecarOnly) == 0 {
 		w.setNewer(0)
 		w.status(StateSyncing, "Up to date with server")
 		return
@@ -214,6 +261,13 @@ func (w *Watcher) runPull() {
 		}
 	}
 
+	// Sidecar-only carries: the save is already in sync, so these are applied
+	// silently (no dialog) — but always behind the game-open guard, and the server
+	// wins (last-writer-wins; the save-exit push covers the other direction).
+	for _, c := range sidecarOnly {
+		w.applySidecars(c, before)
+	}
+
 	w.refreshNewer()
 }
 
@@ -251,6 +305,84 @@ func (w *Watcher) applyCandidate(c candidate, before time.Time) {
 	w.recordPulled(c.filename, c.entry.SHA256)
 	w.logOnce(c.filename, c.filename+": pulled from server")
 	w.status(StateSyncing, "Pulled "+c.filename)
+	// The map-exploration sidecars ride along with the character save.
+	w.applySidecars(c, before)
+}
+
+// applySidecars downloads and writes the map-exploration sidecars for a character
+// candidate. It backs the map (server wins, last-writer-wins) for two paths: the
+// coupled pull (right after a successful .d2s write) and the silent sidecar-only
+// carry. Each file is sanitized against the character base, its payload sha is
+// verified against both the batch JSON and the manifest, and it is written with
+// the same atomic + backup discipline as a save. A per-file failure is logged and
+// skipped — the .d2s (if any) is already applied and the rest recovers next cycle.
+func (w *Watcher) applySidecars(c candidate, before time.Time) {
+	if !w.MapSyncEnabled() {
+		return
+	}
+	if c.entry.SidecarsDownloadPath == "" || len(c.entry.Sidecars) == 0 {
+		return
+	}
+	if !strings.EqualFold(filepath.Ext(c.filename), ".d2s") {
+		return // sidecars belong to characters only
+	}
+	base := sidecarBase(c.filename)
+
+	// Determine which sidecars actually differ from local; skip the in-sync ones
+	// so we never back up or rewrite an identical file.
+	want := map[string]string{} // sanitized filename -> manifest sha
+	for _, s := range c.entry.Sidecars {
+		clean, ok := sanitizeSidecarFilename(s.Filename, base)
+		if !ok {
+			w.logOnce("__sidecar__"+c.filename+"/"+s.Filename, "Ignoring unsafe sidecar name from server: "+s.Filename)
+			continue
+		}
+		if local, present := w.localSHA(clean); present && strings.EqualFold(local, s.SHA256) {
+			continue // already in sync
+		}
+		want[clean] = s.SHA256
+	}
+	if len(want) == 0 {
+		return
+	}
+
+	// Never write while a game session looks active (reinforcement, always on).
+	if !w.guardAllowsWrite(before) {
+		return
+	}
+
+	resp, err := w.Client.DownloadSidecars(c.entry.SidecarsDownloadPath)
+	if err != nil {
+		w.logOnce("__sidecar__"+c.filename, c.filename+": sidecar download failed — "+err.Error())
+		return
+	}
+	for _, f := range resp.Files {
+		clean, ok := sanitizeSidecarFilename(f.Filename, base)
+		if !ok {
+			w.logOnce("__sidecar__"+c.filename+"/"+f.Filename, "Ignoring unsafe sidecar name from server: "+f.Filename)
+			continue
+		}
+		manifestSHA, wanted := want[clean]
+		if !wanted {
+			continue // not requested (already in sync or absent from the manifest)
+		}
+		data, err := base64.StdEncoding.DecodeString(f.RawBase64)
+		if err != nil {
+			w.logOnce("__sidecar__"+clean, clean+": sidecar payload could not be decoded")
+			continue
+		}
+		// The payload must match both the batch JSON sha and the manifest sha.
+		if err := verifySHA(clean, data, f.SHA256, manifestSHA); err != nil {
+			w.logOnce("__sidecar__"+clean, clean+": "+err.Error())
+			continue
+		}
+		if err := writeAtomic(w.SavesDir(), w.backupsDir(), clean, data); err != nil {
+			w.logOnce("__sidecar__"+clean, clean+": sidecar write aborted — "+err.Error())
+			continue
+		}
+		w.recordPulled(clean, manifestSHA)
+		w.logOnce("__sidecar__"+clean, clean+": map sidecar pulled from server")
+	}
 }
 
 // useServer resolves a conflict in the server's favor: the local bytes are

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -47,6 +48,12 @@ type Watcher struct {
 	Machine   string
 	syncState *SyncState
 
+	// pendingSidecars queues characters whose map-exploration sidecar batch failed
+	// to upload (base name -> server character name), retried at the top of each
+	// scan. It never blocks or fails the .d2s upload; the scan goroutine owns it,
+	// so it needs no lock.
+	pendingSidecars map[string]string
+
 	mu         sync.Mutex
 	paused     bool
 	interval   time.Duration
@@ -81,6 +88,7 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 		Pending:         make(map[string]FileStat),
 		Uploaded:        make(map[string]string),
 		lastLine:        make(map[string]string),
+		pendingSidecars: make(map[string]string),
 		Machine:         hostname,
 		syncState:       LoadSyncState(statePath),
 		interval:        time.Duration(cfg.PollInterval * float64(time.Second)),
@@ -138,6 +146,26 @@ func (w *Watcher) SyncMode() string {
 		return SyncModeTwoWay
 	}
 	return SyncModePush
+}
+
+// MapSyncEnabled reports whether map-exploration sidecar sync is active
+// (default ON). It is read under w.mu because the tray can toggle it live while
+// the scan goroutine consults it.
+func (w *Watcher) MapSyncEnabled() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Config.MapSyncEnabled()
+}
+
+// SetMapSync toggles map-exploration sidecar sync live and persists it. When off,
+// no sidecar is sent, downloaded, or written; toggling it on lets the next scan
+// flush any queued sidecars.
+func (w *Watcher) SetMapSync(on bool) {
+	w.mu.Lock()
+	v := on
+	w.Config.SyncMapFiles = &v
+	w.mu.Unlock()
+	w.persistConfig()
 }
 
 // SavesDir returns the folder currently being watched. It is read under w.mu
@@ -371,6 +399,13 @@ func (w *Watcher) Scan() {
 	// Snapshot the target once so the whole scan sees a single consistent folder
 	// even if a change lands between iterations of the outer loop.
 	savesDir := w.SavesDir()
+
+	// Flush any sidecar batch that failed on a previous scan before looking at the
+	// saves again. This never touches the .d2s upload flow.
+	if w.MapSyncEnabled() {
+		w.retryPendingSidecars()
+	}
+
 	entries, err := os.ReadDir(savesDir)
 	if err != nil {
 		log.Printf("Error reading saves directory %s: %v", savesDir, err)
@@ -464,6 +499,12 @@ func (w *Watcher) upload(filename, path string, bytes []byte, sha256Hex string) 
 		w.logOnce(path, fmt.Sprintf("%s: %s", filename, resp.Status))
 	}
 	w.status(StateSyncing, "Synced "+filename)
+
+	// A character save carries map-exploration sidecars; push them alongside it.
+	// Shared stashes (resp.Character == nil) have none.
+	if resp.Character != nil && w.MapSyncEnabled() {
+		w.pushSidecars(sidecarBase(filename), resp.Character.Name)
+	}
 }
 
 // logOnce logs a per-file line only when it differs from the last line logged
@@ -477,6 +518,119 @@ func (w *Watcher) logOnce(path, line string) {
 	}
 	w.lastLine[path] = line
 	log.Print(line)
+}
+
+// sidecarBase returns the character base name a set of sidecars shares — the
+// filename with its extension stripped (e.g. "Mira.d2s" -> "Mira").
+func sidecarBase(filename string) string {
+	return strings.TrimSuffix(filename, filepath.Ext(filename))
+}
+
+// localSidecar is one map-exploration file found beside a character save.
+type localSidecar struct {
+	name string // basename, e.g. "Mira.map"
+	sha  string
+	data []byte
+}
+
+// collectSidecars returns the map-exploration sidecars in savesDir that belong to
+// base: exactly "<base>.map" and "<base>.ma<one digit>" (extension compared
+// case-insensitively, like the scan). These are local files we own, so no hostile
+// sanitization is needed — the match is by exact stem plus a valid sidecar ext.
+func collectSidecars(savesDir, base string) ([]localSidecar, error) {
+	entries, err := os.ReadDir(savesDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []localSidecar
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		ext := filepath.Ext(name)
+		if !validSidecarExt(ext) || name[:len(name)-len(ext)] != base {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(savesDir, name))
+		if err != nil {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		out = append(out, localSidecar{name: name, sha: hex.EncodeToString(sum[:]), data: data})
+	}
+	return out, nil
+}
+
+// pushSidecars uploads the map-exploration sidecars sitting beside a character
+// save that was just synced. It sends only the files whose bytes are not already
+// recorded as synced, in one batch keyed by the server's character name. On
+// success each file's sha is recorded; on any failure the character is queued for
+// retry on the next scan. It never affects the .d2s upload outcome.
+func (w *Watcher) pushSidecars(base, charName string) {
+	sidecars, err := collectSidecars(w.SavesDir(), base)
+	if err != nil {
+		w.markSidecarRetry(base, charName)
+		return
+	}
+	var files []SidecarFile
+	for _, sc := range sidecars {
+		if strings.EqualFold(w.lastSyncSHA(sc.name), sc.sha) {
+			continue // already on the server
+		}
+		files = append(files, SidecarFile{
+			Filename:  sc.name,
+			SHA256:    sc.sha,
+			RawBase64: base64.StdEncoding.EncodeToString(sc.data),
+		})
+	}
+	if len(files) == 0 {
+		delete(w.pendingSidecars, base) // nothing outstanding for this character
+		return
+	}
+
+	resp, err := w.Client.UploadSidecars(charName, files, w.Machine)
+	if err != nil {
+		w.logOnce("__sidecar_push__"+base, base+": map sidecar upload failed ("+err.Error()+"); will retry")
+		w.markSidecarRetry(base, charName)
+		return
+	}
+	if resp.Error != "" {
+		w.logOnce("__sidecar_push__"+base, base+": map sidecar upload rejected — "+resp.Error+"; will retry")
+		w.markSidecarRetry(base, charName)
+		return
+	}
+
+	for _, f := range files {
+		w.recordSync(f.Filename, f.SHA256)
+	}
+	delete(w.pendingSidecars, base)
+	w.logOnce("__sidecar_push__"+base, fmt.Sprintf("%s: synced %d map sidecar(s)", base, len(files)))
+}
+
+// retryPendingSidecars re-attempts every queued sidecar batch. It snapshots the
+// keys first so pushSidecars can mutate the map (clear on success, re-queue on
+// failure) without disturbing the range.
+func (w *Watcher) retryPendingSidecars() {
+	if len(w.pendingSidecars) == 0 {
+		return
+	}
+	pending := make(map[string]string, len(w.pendingSidecars))
+	for base, name := range w.pendingSidecars {
+		pending[base] = name
+	}
+	for base, name := range pending {
+		w.pushSidecars(base, name)
+	}
+}
+
+// markSidecarRetry queues a character's sidecars for a later retry, lazily
+// initializing the map so a struct-literal Watcher (tests) stays safe.
+func (w *Watcher) markSidecarRetry(base, charName string) {
+	if w.pendingSidecars == nil {
+		w.pendingSidecars = make(map[string]string)
+	}
+	w.pendingSidecars[base] = charName
 }
 
 // validSave validates a .d2s character file using signature and size header check.

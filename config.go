@@ -33,6 +33,17 @@ type Config struct {
 	SavesDir     string  `json:"saves_dir"`
 	PollInterval float64 `json:"poll_interval"`
 	SyncMode     string  `json:"sync_mode"`
+	// SyncMapFiles toggles syncing the map-exploration sidecar files (.map /
+	// .ma0…) that sit beside each character save. A nil pointer (a config written
+	// before this option existed) is treated as ON, so upgrading users keep the
+	// feature without editing config.json. Read it through MapSyncEnabled.
+	SyncMapFiles *bool `json:"sync_map_files,omitempty"`
+}
+
+// MapSyncEnabled reports whether map-exploration sidecar files should be synced.
+// It defaults to ON: an unset (nil) value means enabled.
+func (c *Config) MapSyncEnabled() bool {
+	return c.SyncMapFiles == nil || *c.SyncMapFiles
 }
 
 // ConfigDir returns the directory holding config.json (and the sync state and

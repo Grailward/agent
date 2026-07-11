@@ -7,6 +7,25 @@ release are published at [grailward.com/download](https://grailward.com/download
 Versions up to v0.2.0 predate this public mirror, so they have no corresponding
 source snapshot here; they are listed for completeness.
 
+## v0.4.0 — 2026-07-10
+
+- **Map exploration sync.** The fog-of-war "reveal" files that Diablo II:
+  Resurrected keeps beside each character save (`<Name>.map` and `<Name>.ma0`…)
+  now travel between your machines along with the character. A new tray toggle,
+  **Sync map exploration** (on by default), governs the whole trail — turn it off
+  and no map file is ever sent, downloaded, or written.
+- The map files ride the character save: they are pushed right after a successful
+  `.d2s` upload and pulled right after a `.d2s` is written in two-way mode. They
+  are not a save — losing a slice only re-reveals a bit of map — so there is no
+  conflict dialog: the server copy wins (last-writer-wins), and reveal files are
+  never versioned. A push that fails is retried silently on the next scan and
+  never holds up the save upload.
+- Same safety discipline as saves for every map write: filenames from the server
+  are strictly sanitized (only `<character>.map` / `<character>.ma<digit>`),
+  payloads are SHA-256-verified, the previous file is backed up first, writes are
+  atomic, and nothing is written while a game session looks active. `.key`/`.ctl`
+  files stay out of scope entirely.
+
 ## v0.3.2 — 2026-07-08
 
 - Embedded file icons: the Windows `.exe` now carries the grailward shield as a PE
