@@ -22,6 +22,16 @@ func main() {
 		log.Fatalf("Configuration error: %v", err)
 	}
 
+	// Remove any leftovers from a previous self-update (the old binary/bundle
+	// kept as a one-level backup) now that this new build started cleanly.
+	if exe, err := currentExecPath(); err == nil {
+		cleanUpdateLeftovers(exe)
+	}
+
+	// If start-at-login is enabled, make sure the login item still points at this
+	// executable — it may have moved, or been replaced by an auto-update.
+	maybeHealStartAtLogin(cfg)
+
 	// Check if saves directory exists and is a directory.
 	info, err := os.Stat(cfg.SavesDir)
 	if err != nil {

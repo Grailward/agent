@@ -4,12 +4,54 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"fyne.io/systray"
 )
 
-// Tray icon bytes (iconSyncing, iconPaused, iconError) are defined in icon.go,
-// which encodes them per platform (raw PNG on macOS, ICO on Windows).
+// Tray icon bytes (iconSyncing, iconPaused, iconError, iconTransferring) are
+// defined in icon.go, which encodes them per platform (raw PNG on macOS, ICO on
+// Windows).
+
+// iconState is the tray's presentation layer for the menu-bar icon: the last
+// coarse state reported and whether a real transfer is currently in flight. It is
+// a pure decision layer (no systray calls) with its own mutex, so it stays
+// unit-testable and is safe to touch from the watcher and tray goroutines alike.
+// While a transfer is active the state icon is frozen (report returns "no change")
+// so a mid-batch "Synced X" report can't flip the activity icon back early; the
+// last reported state is remembered so closing the transfer restores the right
+// icon — the red error latch wins because the last report during a latched batch
+// already carries StateError.
+type iconState struct {
+	mu     sync.Mutex
+	state  State
+	active bool
+}
+
+// report records a new coarse state and returns the icon bytes to show now, or nil
+// if the icon must not change (a transfer is freezing it on the activity icon).
+func (s *iconState) report(state State) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = state
+	if s.active {
+		return nil
+	}
+	return iconForState(state)
+}
+
+// setActive flips the transfer-activity flag and returns the icon bytes to show:
+// the activity icon when turning on, the icon for the last reported state when
+// turning off.
+func (s *iconState) setActive(active bool) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active = active
+	if active {
+		return iconTransferring
+	}
+	return iconForState(s.state)
+}
 
 // pollPresets are the poll intervals offered in the tray submenu.
 var pollPresets = []struct {
@@ -27,13 +69,17 @@ type tray struct {
 	watcher *Watcher
 	client  *Client
 
-	mToggle     *systray.MenuItem
-	mResetTok   *systray.MenuItem
-	mPolls      []*systray.MenuItem
-	mPull       *systray.MenuItem
-	mModePush   *systray.MenuItem
-	mModeTwoWay *systray.MenuItem
-	mMapSync    *systray.MenuItem
+	icon iconState // menu-bar icon presentation state (state + transfer activity)
+
+	mToggle       *systray.MenuItem
+	mResetTok     *systray.MenuItem
+	mPolls        []*systray.MenuItem
+	mPull         *systray.MenuItem
+	mModePush     *systray.MenuItem
+	mModeTwoWay   *systray.MenuItem
+	mMapSync      *systray.MenuItem
+	mStartAtLogin *systray.MenuItem
+	mUpdate       *systray.MenuItem
 }
 
 // RunTray takes over the main thread and runs the menu-bar UI. The watcher
@@ -69,6 +115,11 @@ func (t *tray) onReady() {
 		"Also sync each character's explored-map files across machines",
 		t.watcher.MapSyncEnabled())
 
+	// Start-at-login toggle (default off): install/remove a per-user OS login item.
+	t.mStartAtLogin = systray.AddMenuItemCheckbox("Start with system",
+		"Launch the agent automatically when you log in",
+		t.watcher.StartAtLoginEnabled())
+
 	// On-demand pull; only meaningful (and shown) in two-way mode.
 	t.mPull = systray.AddMenuItem("Pull latest now", "Check the server for newer saves and pull them")
 	if !twoWay {
@@ -84,12 +135,19 @@ func (t *tray) onReady() {
 	systray.AddSeparator()
 	t.mResetTok = systray.AddMenuItem("Reset token", "Clear the stored token and enter a new one")
 	mAbout := systray.AddMenuItem("About Grailward Agent", "Version and configuration details")
+	// Self-update offer: hidden until a newer version is published, then shows
+	// "Update to vX.Y.Z…" (or "Update failed — see log" after a failed apply).
+	t.mUpdate = systray.AddMenuItem("Update", "Download and install the newest version, then restart")
+	t.mUpdate.Hide()
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Stop the agent")
 
-	// Wire the watcher's status + newer-count into the tray, then start polling.
+	// Wire the watcher's status + newer-count + transfer activity + update offer
+	// into the tray, then start polling.
 	t.watcher.SetStatusFunc(t.render)
 	t.watcher.SetNewerFunc(t.renderNewer)
+	t.watcher.SetActivityFunc(t.renderActivity)
+	t.watcher.SetUpdateFunc(t.renderUpdate)
 	go t.watcher.Start()
 
 	// Event loop: systray channels fire on menu clicks.
@@ -106,6 +164,10 @@ func (t *tray) onReady() {
 				t.setMode(SyncModeTwoWay)
 			case <-t.mMapSync.ClickedCh:
 				t.toggleMapSync()
+			case <-t.mStartAtLogin.ClickedCh:
+				t.toggleStartAtLogin()
+			case <-t.mUpdate.ClickedCh:
+				t.watcher.RequestUpdate()
 			case <-mOpenFolder.ClickedCh:
 				if err := OpenPath(t.watcher.SavesDir()); err != nil {
 					log.Printf("Could not open saves folder: %v", err)
@@ -140,21 +202,27 @@ func (t *tray) onReady() {
 	}
 }
 
-// render reflects a watcher state change onto the icon + status line. It runs
-// on the watcher's goroutine, but systray setters are safe to call from anywhere.
+// render reflects a watcher state change onto the icon + status line. It runs on
+// the watcher's goroutine (and, for a few actions, the tray goroutine), but systray
+// setters and iconState are safe to call from anywhere. The icon is chosen by
+// iconState so an in-flight transfer keeps the activity icon (report returns nil).
 func (t *tray) render(state State, message string) {
-	switch state {
-	case StatePaused:
-		systray.SetIcon(iconPaused)
+	if b := t.icon.report(state); b != nil {
+		systray.SetIcon(b)
+	}
+	if state == StatePaused {
 		t.mToggle.SetTitle("Resume sync")
-	case StateError:
-		systray.SetIcon(iconError)
-		t.mToggle.SetTitle("Pause sync")
-	default: // StateSyncing
-		systray.SetIcon(iconSyncing)
+	} else {
 		t.mToggle.SetTitle("Pause sync")
 	}
 	systray.SetTooltip(fmt.Sprintf("Grailward Agent %s — %s", Version, message))
+}
+
+// renderActivity shows the transfer-activity icon while a batch is in flight and
+// restores the state-derived icon when it ends. Driven by the watcher's transfer
+// scope; runs on the scan goroutine.
+func (t *tray) renderActivity(active bool) {
+	systray.SetIcon(t.icon.setActive(active))
 }
 
 // showAbout builds the About panel text from the live config and shows it in a
@@ -201,6 +269,26 @@ func (t *tray) renderNewer(count int) {
 	}
 }
 
+// renderUpdate reflects the self-update offer onto its menu item: hidden when
+// there's nothing newer, "Update to vX.Y.Z…" when an update is available, or
+// "Update failed — see log" after a failed apply (still clickable to retry). Runs
+// on the scan goroutine; systray setters are safe there.
+func (t *tray) renderUpdate(state updateUIState, version string) {
+	if t.mUpdate == nil {
+		return
+	}
+	switch state {
+	case updateAvailable:
+		t.mUpdate.SetTitle("Update to " + version + "…")
+		t.mUpdate.Show()
+	case updateFailed:
+		t.mUpdate.SetTitle("Update failed — see log")
+		t.mUpdate.Show()
+	default: // updateNone
+		t.mUpdate.Hide()
+	}
+}
+
 // setMode switches the sync mode, updates the radio checks and the visibility
 // of the pull item.
 func (t *tray) setMode(mode string) {
@@ -226,6 +314,30 @@ func (t *tray) toggleMapSync() {
 	} else {
 		t.mMapSync.Uncheck()
 	}
+}
+
+// toggleStartAtLogin flips the OS login item and reflects the outcome on the
+// checkbox. It reads the state back from the watcher (which only persists what
+// actually took effect), so a failed OS write leaves the box unchecked instead of
+// lying — the real state always wins.
+func (t *tray) toggleStartAtLogin() {
+	want := !t.mStartAtLogin.Checked()
+	if err := t.watcher.SetStartAtLogin(want); err != nil {
+		log.Printf("Could not %s start-at-login: %v", enableOrDisable(want), err)
+	}
+	if t.watcher.StartAtLoginEnabled() {
+		t.mStartAtLogin.Check()
+	} else {
+		t.mStartAtLogin.Uncheck()
+	}
+}
+
+// enableOrDisable renders a bool as the verb used in the start-at-login log line.
+func enableOrDisable(on bool) string {
+	if on {
+		return "enable"
+	}
+	return "disable"
 }
 
 func (t *tray) syncPollChecks(active int) {

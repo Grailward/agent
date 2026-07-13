@@ -221,6 +221,12 @@ func (w *Watcher) runPull() {
 		return
 	}
 	w.ensureSeams()
+	// Bracket the pull as a transfer scope: applying a candidate (download/write)
+	// or carrying a sidecar flips the tray to the activity icon, restored when the
+	// pull returns. The manifest fetch alone is metadata, not a transfer, so a pull
+	// that finds nothing to apply never touches the icon.
+	w.enterTransfers()
+	defer w.leaveTransfers()
 	cands, known, err := w.evaluate()
 	if err != nil {
 		w.reportPullError(err)
@@ -315,6 +321,7 @@ func (w *Watcher) applyCandidate(c candidate, before time.Time) {
 	if !w.guardAllowsWrite(before) {
 		return
 	}
+	w.noteTransfer() // a real download is starting — show the activity icon
 	data, xsha, err := w.Client.Download(c.entry.DownloadPath)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": download failed — "+err.Error())
@@ -379,6 +386,7 @@ func (w *Watcher) applySidecars(c candidate, before time.Time) {
 		return
 	}
 
+	w.noteTransfer() // sidecar bytes are actually being fetched now
 	resp, err := w.Client.DownloadSidecars(c.entry.SidecarsDownloadPath)
 	if err != nil {
 		w.logOnce("__sidecar__"+c.filename, c.filename+": sidecar download failed — "+err.Error())
@@ -433,6 +441,7 @@ func (w *Watcher) useServer(c candidate, before time.Time) {
 	sum := sha256.Sum256(localBytes)
 	localSHA := hex.EncodeToString(sum[:])
 
+	w.noteTransfer() // backing the local copy up to the server is a real transfer
 	resp, err := w.Client.UploadSnapshotBackup(c.filename, localBytes, localSHA, w.Machine)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": backup upload failed — "+err.Error())
@@ -505,6 +514,12 @@ func (w *Watcher) ensureSeams() {
 	}
 	if w.gameRunning == nil {
 		w.gameRunning = GameLikelyRunning
+	}
+	if w.confirmUpdate == nil {
+		w.confirmUpdate = ConfirmUpdate
+	}
+	if w.applyUpdate == nil {
+		w.applyUpdate = ApplyUpdate
 	}
 }
 

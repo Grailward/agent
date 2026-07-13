@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,9 +72,32 @@ type Watcher struct {
 
 	reset     chan struct{} // wakes the loop when interval/pause changes
 	pullReq   chan struct{} // requests an interactive pull on the scan goroutine
+	updateReq chan struct{} // requests an interactive self-update on the scan goroutine
 	changeDir chan string   // requests a live saves-folder swap on the scan goroutine
 	onStatus  StatusFunc
 	onNewer   NewerFunc
+
+	// Transfer-activity indicator. A real byte transfer — a save
+	// upload, a pull download/write, a map-sidecar carry — flips the tray to a
+	// distinct "transferring" icon so an active transfer reads differently from the
+	// idle watching state; a routine scan that sends nothing never triggers it.
+	// Every transfer runs on the single scan goroutine, bracketed by a transfer
+	// scope (Scan and runPull each open one); noteTransfer flips the icon on the
+	// first transfer inside a scope, and closing the outermost scope restores the
+	// state-derived icon. All three are guarded by w.mu like the rest of the shared
+	// tray state; the scan goroutine writes them and the tray reads onActivity.
+	onActivity func(active bool)
+	xferDepth  int
+	xferShown  bool
+
+	// Self-update offer state, shared with the tray and guarded by w.mu. The scan
+	// goroutine sets/clears the offer from a manifest check; the tray reads onUpdate
+	// to show the "Update to vX.Y.Z…" item. The check is a separate concern from the
+	// sync-error latch — an update failure never turns the tray red.
+	onUpdate       func(state updateUIState, version string)
+	updateOffer    *UpdateFile
+	updateOfferVer string
+	updateState    updateUIState
 
 	// persistMu serializes config.json writes so concurrent preference changes
 	// (interval / sync mode / token, driven from different tray goroutines)
@@ -85,6 +109,23 @@ type Watcher struct {
 	confirmPull     func(message string) (bool, error)
 	resolveConflict func(filename string) (ConflictChoice, error)
 	gameRunning     func(savesDir string, before time.Time) (bool, string)
+
+	// Test seams for the OS login item. Default to the real per-user
+	// platform implementations; a nil seam falls back to them at call time so a
+	// struct-literal Watcher (tests) stays safe.
+	enableLoginItem  func(execPath string) error
+	disableLoginItem func() error
+
+	// Self-update seams + config. updateURL/updateHTTP/currentVersion default to the
+	// production manifest URL, the default HTTP client, and the embedded build
+	// Version; confirmUpdate/applyUpdate default to the platform dialog + swap. Tests
+	// point updateURL at an httptest server and inject the interactive/OS seams.
+	updateURL      string
+	updateHTTP     *http.Client
+	currentVersion string
+	confirmUpdate  func(version string) (bool, error)
+	applyUpdate    func(execPath string, file *UpdateFile, data []byte) error
+	showMessage    func(message string) error // defaults to ShowAbout
 }
 
 func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
@@ -94,22 +135,28 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 	}
 	statePath, _ := SyncStatePath()
 	return &Watcher{
-		Config:          cfg,
-		Client:          client,
-		Pending:         make(map[string]FileStat),
-		Uploaded:        make(map[string]string),
-		lastLine:        make(map[string]string),
-		errs:            make(map[string]string),
-		pendingSidecars: make(map[string]string),
-		Machine:         hostname,
-		syncState:       LoadSyncState(statePath),
-		interval:        time.Duration(cfg.PollInterval * float64(time.Second)),
-		reset:           make(chan struct{}, 1),
-		pullReq:         make(chan struct{}, 1),
-		changeDir:       make(chan string, 1),
-		confirmPull:     ConfirmPull,
-		resolveConflict: ResolveConflict,
-		gameRunning:     GameLikelyRunning,
+		Config:           cfg,
+		Client:           client,
+		Pending:          make(map[string]FileStat),
+		Uploaded:         make(map[string]string),
+		lastLine:         make(map[string]string),
+		errs:             make(map[string]string),
+		pendingSidecars:  make(map[string]string),
+		Machine:          hostname,
+		syncState:        LoadSyncState(statePath),
+		interval:         time.Duration(cfg.PollInterval * float64(time.Second)),
+		reset:            make(chan struct{}, 1),
+		pullReq:          make(chan struct{}, 1),
+		updateReq:        make(chan struct{}, 1),
+		changeDir:        make(chan string, 1),
+		confirmPull:      ConfirmPull,
+		resolveConflict:  ResolveConflict,
+		gameRunning:      GameLikelyRunning,
+		enableLoginItem:  enableStartAtLogin,
+		disableLoginItem: disableStartAtLogin,
+		currentVersion:   Version,
+		confirmUpdate:    ConfirmUpdate,
+		applyUpdate:      ApplyUpdate,
 	}, nil
 }
 
@@ -248,6 +295,62 @@ func (w *Watcher) setNewer(count int) {
 	}
 }
 
+// SetActivityFunc registers the callback that shows/hides the transfer-activity
+// icon. A no-op default keeps headless/CLI runs working.
+func (w *Watcher) SetActivityFunc(f func(active bool)) {
+	w.mu.Lock()
+	w.onActivity = f
+	w.mu.Unlock()
+}
+
+// enterTransfers opens a transfer scope. Scan and runPull each bracket their body
+// with enter/leave; noteTransfer inside flips the tray to the activity icon on the
+// first real transfer, and leaveTransfers restores the state-derived icon when the
+// outermost scope closes. A scope with no transfer never touches the icon, so a
+// routine scan stays quiet.
+func (w *Watcher) enterTransfers() {
+	w.mu.Lock()
+	w.xferDepth++
+	w.mu.Unlock()
+}
+
+// noteTransfer marks that a real byte transfer is starting. The first one inside a
+// scope flips the tray to the activity icon; later ones in the same scope are
+// no-ops (no flicker between files in one scan). A stray call outside any scope is
+// ignored so the activity icon can never get stuck on.
+func (w *Watcher) noteTransfer() {
+	w.mu.Lock()
+	show := w.xferDepth > 0 && !w.xferShown
+	if show {
+		w.xferShown = true
+	}
+	f := w.onActivity
+	w.mu.Unlock()
+	if show && f != nil {
+		f(true)
+	}
+}
+
+// leaveTransfers closes a transfer scope. When the outermost scope closes and the
+// activity icon was shown, it hides it; the tray then restores the icon for the
+// last reported state, so a batch that ended with a latched error comes back red
+// (the red latch wins) rather than plain gold.
+func (w *Watcher) leaveTransfers() {
+	w.mu.Lock()
+	if w.xferDepth > 0 {
+		w.xferDepth--
+	}
+	restore := w.xferDepth == 0 && w.xferShown
+	if restore {
+		w.xferShown = false
+	}
+	f := w.onActivity
+	w.mu.Unlock()
+	if restore && f != nil {
+		f(false)
+	}
+}
+
 // SyncMode returns the current sync mode (push or two_way).
 func (w *Watcher) SyncMode() string {
 	w.mu.Lock()
@@ -281,6 +384,49 @@ func (w *Watcher) SetMapSync(on bool) {
 		w.clearErrsFunc(func(key string) bool { return strings.HasPrefix(key, sidecarErrPrefix) })
 	}
 	w.persistConfig()
+}
+
+// StartAtLoginEnabled reports whether the OS login item is configured. Read under
+// w.mu because the tray toggles it live.
+func (w *Watcher) StartAtLoginEnabled() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Config.StartAtLogin
+}
+
+// SetStartAtLogin turns the per-user OS login item on or off and, only if that
+// OS write succeeds, persists the preference. The OS write is attempted first so a
+// failure never leaves config.json claiming a state the system doesn't have — the
+// tray reads back StartAtLoginEnabled and reflects reality instead of lying. It
+// runs on the tray goroutine (like the other preference writes); the platform
+// calls touch only per-user paths and need no elevation.
+func (w *Watcher) SetStartAtLogin(on bool) error {
+	if on {
+		exec, err := currentExecPath()
+		if err != nil {
+			return err
+		}
+		enable := w.enableLoginItem
+		if enable == nil {
+			enable = enableStartAtLogin
+		}
+		if err := enable(exec); err != nil {
+			return err
+		}
+	} else {
+		disable := w.disableLoginItem
+		if disable == nil {
+			disable = disableStartAtLogin
+		}
+		if err := disable(); err != nil {
+			return err
+		}
+	}
+	w.mu.Lock()
+	w.Config.StartAtLogin = on
+	w.mu.Unlock()
+	w.persistConfig()
+	return nil
 }
 
 // SavesDir returns the folder currently being watched. It is read under w.mu
@@ -435,8 +581,13 @@ func (w *Watcher) Start() {
 		w.RequestPull()
 	}
 
+	// Startup self-update check (log-only on failure; never latches).
+	w.checkForUpdate()
+
 	syncTimer := time.NewTimer(syncCheckInterval)
 	defer syncTimer.Stop()
+	updateTimer := time.NewTimer(updateCheckInterval)
+	defer updateTimer.Stop()
 
 	for {
 		scanTimer := time.NewTimer(w.currentInterval())
@@ -446,6 +597,9 @@ func (w *Watcher) Start() {
 		case <-w.pullReq:
 			scanTimer.Stop()
 			w.runPull()
+		case <-w.updateReq:
+			scanTimer.Stop()
+			w.runUpdate()
 		case dir := <-w.changeDir:
 			scanTimer.Stop()
 			if w.applyDirChange(dir) {
@@ -455,6 +609,10 @@ func (w *Watcher) Start() {
 			scanTimer.Stop()
 			w.periodicSyncCheck()
 			syncTimer.Reset(syncCheckInterval)
+		case <-updateTimer.C:
+			scanTimer.Stop()
+			w.checkForUpdate()
+			updateTimer.Reset(updateCheckInterval)
 		case <-w.reset:
 			scanTimer.Stop()
 		}
@@ -518,6 +676,12 @@ func (w *Watcher) applyDirChange(dir string) bool {
 
 // Scan performs a single directory scan.
 func (w *Watcher) Scan() {
+	// Bracket the scan as a transfer scope: the first upload/sidecar carry flips
+	// the tray to the activity icon, restored when the scan returns. A scan that
+	// sends nothing never touches the icon.
+	w.enterTransfers()
+	defer w.leaveTransfers()
+
 	// Snapshot the target once so the whole scan sees a single consistent folder
 	// even if a change lands between iterations of the outer loop.
 	savesDir := w.SavesDir()
@@ -595,6 +759,7 @@ func (w *Watcher) Scan() {
 }
 
 func (w *Watcher) upload(filename, path string, bytes []byte, sha256Hex string) {
+	w.noteTransfer() // a real upload is starting — show the activity icon
 	resp, err := w.Client.UploadSnapshot(filename, bytes, sha256Hex, w.Machine)
 	if err != nil {
 		w.logOnce(path, fmt.Sprintf("%s: network failure (%v); will retry in next scan", filename, err))
@@ -711,6 +876,7 @@ func (w *Watcher) pushSidecars(base, charName string) {
 		return
 	}
 
+	w.noteTransfer() // sidecar bytes are actually going out now
 	resp, err := w.Client.UploadSidecars(charName, files, w.Machine)
 	if err != nil {
 		w.logOnce("__sidecar_push__"+base, base+": map sidecar upload failed ("+err.Error()+"); will retry")

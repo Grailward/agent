@@ -15,6 +15,9 @@ var pngPaused []byte
 //go:embed icons/error.png
 var pngError []byte
 
+//go:embed icons/transferring.png
+var pngTransferring []byte
+
 // Tray icon bytes in the encoding the host platform's systray backend expects.
 // The fyne.io/systray backends on macOS and Linux take a raw PNG, but the Win32
 // backend only accepts the ICO container format (a PNG hands it a blank icon).
@@ -26,7 +29,23 @@ var (
 	iconSyncing = trayIcon(pngSyncing)
 	iconPaused  = trayIcon(pngPaused)
 	iconError   = trayIcon(pngError)
+	// iconTransferring is the activity badge (a circle of arrows) shown while a
+	// real transfer batch is in flight, distinct from the idle "watching" state.
+	iconTransferring = trayIcon(pngTransferring)
 )
+
+// iconForState maps a coarse run state to its tray icon bytes. It is a pure
+// lookup so the tray's icon decisions stay unit-testable without a live systray.
+func iconForState(state State) []byte {
+	switch state {
+	case StatePaused:
+		return iconPaused
+	case StateError:
+		return iconError
+	default: // StateSyncing
+		return iconSyncing
+	}
+}
 
 // trayIcon returns the platform-appropriate encoding of a tray icon.
 func trayIcon(png []byte) []byte {

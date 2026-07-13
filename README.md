@@ -191,8 +191,12 @@ prompts for it (and for the saves folder) with a native dialog on first run.
   you fully control instead; signing + notarization is a paid Developer-ID step we haven't
   taken yet.
 - **Windows builds need mingw locally** (or a CI runner).
-- **No auto-update.** The release manifest leaves the door open, but an installed copy keeps
-  running until it's manually replaced.
+- **Updates are offered, never forced.** The agent checks the release manifest in the
+  background (on start and every ~6 h); when a newer version exists, an "Update to vX.Y.Z…"
+  item appears in the tray menu. Nothing is downloaded or replaced until you click it and
+  confirm — the new binary is SHA-256-verified against the manifest before the swap, the
+  previous copy is kept as a one-level backup, and the agent relaunches itself. No update
+  is ever applied while a transfer is in flight or the game looks open.
 
 ## License & affiliation
 

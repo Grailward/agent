@@ -4,13 +4,137 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/windows/registry"
 )
+
+// ConfirmUpdate shows an OK/Cancel confirmation before applying an update
+// (OK = Update, Cancel = Later). Returns true only when the user chooses Update.
+func ConfirmUpdate(version string) (bool, error) {
+	script := `
+Add-Type -AssemblyName System.Windows.Forms
+$r = [System.Windows.Forms.MessageBox]::Show($env:GW_MSG, "Grailward Agent - Update", [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output "1" } else { Write-Output "0" }
+`
+	msg := fmt.Sprintf("A new version of Grailward Agent (%s) is available.\r\n\r\nGrailward will download it, replace this copy, and restart. Update now?", version)
+	out, err := runPowerShell(script, "GW_MSG="+msg)
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(out) == "1", nil
+}
+
+// ApplyUpdate replaces the running .exe and relaunches. A running Windows binary
+// can't be overwritten but can be renamed, so the current exe is moved aside to
+// ".old" (removed on the next start) and the new bytes take its path. On success
+// this does not return — it spawns the new exe and exits.
+func ApplyUpdate(execPath string, file *UpdateFile, data []byte) error {
+	dir := filepath.Dir(execPath)
+	tmp, err := os.CreateTemp(dir, ".gw-update-*.exe") // same volume => atomic rename
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+
+	old := execPath + ".old"
+	_ = os.Remove(old)
+	if err := os.Rename(execPath, old); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, execPath); err != nil {
+		_ = os.Rename(old, execPath) // best-effort restore
+		os.Remove(tmpName)
+		return err
+	}
+
+	log.Printf("Update applied; restarting %s", execPath)
+	if err := exec.Command(execPath, os.Args[1:]...).Start(); err != nil {
+		log.Printf("Relaunch failed (%v); please start Grailward Agent manually", err)
+	}
+	os.Exit(0)
+	return nil // unreachable
+}
+
+// cleanUpdateLeftovers removes the previous exe (".old") and any stray staging
+// files beside the executable (best-effort; called at startup).
+func cleanUpdateLeftovers(execPath string) {
+	_ = os.Remove(execPath + ".old")
+	dir := filepath.Dir(execPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".gw-update-") {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+// runKeyPath is the per-user (HKCU) autostart key; runKeyName is this agent's
+// value under it. HKCU needs no elevation, and a distinct value name keeps the
+// login item independent of any other program's entries.
+const (
+	runKeyPath = `Software\Microsoft\Windows\CurrentVersion\Run`
+	runKeyName = "GrailwardAgent"
+)
+
+// enableStartAtLogin writes the HKCU Run value pointing (quoted) at execPath.
+func enableStartAtLogin(execPath string) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKeyPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetStringValue(runKeyName, runKeyValue(execPath))
+}
+
+// disableStartAtLogin deletes the HKCU Run value. A missing value is not an error
+// (the login item is already gone).
+func disableStartAtLogin() error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKeyPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if err := k.DeleteValue(runKeyName); err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// startAtLoginExecPath returns the executable path currently registered in the
+// HKCU Run value (quotes stripped), or ("", false) when there is no such value.
+func startAtLoginExecPath() (string, bool) {
+	k, err := registry.OpenKey(registry.CURRENT_USER, runKeyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return "", false
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue(runKeyName)
+	if err != nil {
+		return "", false
+	}
+	return unquoteRunValue(v), true
+}
 
 // GetDefaultSavesDir returns the standard Windows D2R saves path.
 func GetDefaultSavesDir() string {

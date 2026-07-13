@@ -38,6 +38,11 @@ type Config struct {
 	// before this option existed) is treated as ON, so upgrading users keep the
 	// feature without editing config.json. Read it through MapSyncEnabled.
 	SyncMapFiles *bool `json:"sync_map_files,omitempty"`
+	// StartAtLogin mirrors whether the per-user OS login item is installed, so the
+	// tray checkbox reflects the setting across restarts and startup self-heal can
+	// tell whether a login item is expected. Default off (opt-in); omitted from the
+	// file when false so older configs stay clean.
+	StartAtLogin bool `json:"start_at_login,omitempty"`
 }
 
 // MapSyncEnabled reports whether map-exploration sidecar files should be synced.

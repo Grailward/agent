@@ -7,6 +7,30 @@ release are published at [grailward.com/download](https://grailward.com/download
 Versions up to v0.2.0 predate this public mirror, so they have no corresponding
 source snapshot here; they are listed for completeness.
 
+## v0.5.0 — 2026-07-13
+
+- **Automatic updates.** The agent now checks for a newer version on startup and
+  every few hours. When one is out, a **Update to vX.Y.Z…** item appears in the
+  menu — no pop-ups, no red icon. Choose it and, after a confirmation, the agent
+  downloads the new build, verifies its SHA-256 checksum, replaces itself and
+  restarts. It never updates while Diablo II: Resurrected is running, keeps the
+  previous version as a one-time backup, and a failed download or checksum mismatch
+  is reported as **Update failed — see log** without touching your saves. Update
+  checks are silent when they fail — an update hiccup is never shown as a sync
+  error.
+- **Transfer activity indicator.** While the agent is actively sending or
+  receiving a save (or its map-exploration files), the menu-bar / tray icon shows
+  a circle of arrows, distinct from the steady "watching" icon — so an in-progress
+  transfer reads differently from the idle watch state at a glance. It shows only
+  for real transfers: a routine folder scan that finds nothing to sync never
+  flickers it, and an error still wins (the icon returns to red when a transfer
+  ends on a failure).
+- **Start with system.** A new tray toggle, **Start with system** (off by
+  default), launches the agent automatically when you log in — a per-user login
+  item on both macOS and Windows, needing no administrator privileges. If the app
+  is later moved or replaced by an update, it repairs the login item on the next
+  start; turning the toggle off removes it.
+
 ## v0.4.1 — 2026-07-13
 
 - **Sync errors now stay visible.** A failed download — the sync manifest, a save
