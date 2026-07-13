@@ -71,6 +71,33 @@ func startAtLoginExecPath() (string, bool) {
 	return parseLaunchAgentExec(string(data))
 }
 
+// startAtLoginUpToDate reports whether the on-disk LaunchAgent plist is byte-for-byte
+// what this build would write for execPath. It is how the startup self-heal notices
+// a plist written by an older version (one that predates AssociatedBundleIdentifiers)
+// and rewrites it. A missing or unreadable plist reads as not up to date so the heal
+// recreates it.
+func startAtLoginUpToDate(execPath string) bool {
+	path, err := launchAgentPath()
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return launchAgentUpToDate(string(data), execPath)
+}
+
+// startAtLoginTarget describes where the login item lives — the LaunchAgent plist
+// path — for the enable log line. Best effort: falls back to the bare filename when
+// the home directory can't be resolved.
+func startAtLoginTarget() string {
+	if path, err := launchAgentPath(); err == nil {
+		return path
+	}
+	return launchAgentLabel + ".plist"
+}
+
 // ConfirmUpdate shows a two-button confirmation before applying an update.
 // Returns true only when the user explicitly chooses Update.
 func ConfirmUpdate(version string) (bool, error) {

@@ -4,9 +4,43 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// TestSetMapSyncLogsChange: toggling map-exploration sync logs the new state on one
+// discrete line each way, with no logOnce dedup — a preference change is an event,
+// not a persistent per-file condition.
+func TestSetMapSyncLogsChange(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+
+	var buf bytes.Buffer
+	orig, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() { log.SetOutput(orig); log.SetFlags(flags) }()
+
+	on := true
+	w := &Watcher{
+		Config:   &Config{SyncMapFiles: &on},
+		lastLine: map[string]string{},
+		errs:     map[string]string{},
+	}
+
+	w.SetMapSync(false)
+	w.SetMapSync(true)
+
+	out := buf.String()
+	if !strings.Contains(out, "Sync map exploration disabled") {
+		t.Fatalf("missing disable line in:\n%s", out)
+	}
+	if !strings.Contains(out, "Sync map exploration enabled") {
+		t.Fatalf("missing enable line in:\n%s", out)
+	}
+}
 
 // TestLogOnceSuppressesRepeats guards the fix for the log-spam bug: a
 // persistent, unchanged per-file condition (e.g. HTTP 401 every poll) must be

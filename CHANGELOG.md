@@ -7,6 +7,18 @@ release are published at [grailward.com/download](https://grailward.com/download
 Versions up to v0.2.0 predate this public mirror, so they have no corresponding
 source snapshot here; they are listed for completeness.
 
+## v0.5.1 — 2026-07-13
+
+- **Preference changes are written to the log.** Turning **Start with system** on
+  or off, switching sync mode, changing the poll interval, and toggling map-
+  exploration sync each record one line in the agent log — so the log is a complete
+  audit trail of what changed and when. The "Start with system" line now names the
+  exact login item it created (or removed).
+- **macOS Login Items attribution.** The macOS login item now advertises the app it
+  belongs to, which helps macOS associate the entry in **Login Items & Extensions**
+  with Grailward Agent. Older login items are refreshed automatically on the next
+  start.
+
 ## v0.5.0 — 2026-07-13
 
 - **Automatic updates.** The agent now checks for a newer version on startup and

@@ -136,6 +136,20 @@ func startAtLoginExecPath() (string, bool) {
 	return unquoteRunValue(v), true
 }
 
+// startAtLoginUpToDate reports whether the registered login item is current for
+// execPath. On Windows the HKCU Run value is fully determined by the executable path
+// (runKeyValue), which the exec-path heal check already covers, so there is no extra
+// content to refresh.
+func startAtLoginUpToDate(string) bool {
+	return true
+}
+
+// startAtLoginTarget describes where the login item lives — the HKCU Run value — for
+// the enable log line.
+func startAtLoginTarget() string {
+	return `HKCU\` + runKeyPath + `\` + runKeyName
+}
+
 // GetDefaultSavesDir returns the standard Windows D2R saves path.
 func GetDefaultSavesDir() string {
 	home, err := os.UserHomeDir()

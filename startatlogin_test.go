@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,6 +108,86 @@ func TestConfigStartAtLoginRoundTrip(t *testing.T) {
 	}
 	if !got.StartAtLogin {
 		t.Fatal("explicit start_at_login=true did not round-trip")
+	}
+}
+
+// TestLaunchAgentPlistBundleAssociation: an executable inside a .app gets the
+// AssociatedBundleIdentifiers key (naming the real bundle id) so the macOS Login
+// Items panel can attribute the item to the app; a raw binary omits the key
+// because it has no bundle to point at.
+func TestLaunchAgentPlistBundleAssociation(t *testing.T) {
+	bundleExec := "/Applications/Grailward Agent.app/Contents/MacOS/grailward-agent"
+	p := launchAgentPlist(bundleExec)
+	if !strings.Contains(p, "<key>AssociatedBundleIdentifiers</key>") {
+		t.Fatalf("bundle exec should get AssociatedBundleIdentifiers:\n%s", p)
+	}
+	if !strings.Contains(p, "<string>"+bundleIdentifier+"</string>") {
+		t.Fatalf("association must name the bundle id %q:\n%s", bundleIdentifier, p)
+	}
+
+	rawExec := "/usr/local/bin/grailward-agent"
+	if r := launchAgentPlist(rawExec); strings.Contains(r, "AssociatedBundleIdentifiers") {
+		t.Fatalf("raw binary must not get AssociatedBundleIdentifiers:\n%s", r)
+	}
+}
+
+// TestLaunchAgentUpToDate drives the self-heal freshness decision: a plist written
+// by an older version (missing AssociatedBundleIdentifiers) reads as out of date
+// for a bundle executable, so startup rewrites it; the freshly generated plist
+// reads as up to date.
+func TestLaunchAgentUpToDate(t *testing.T) {
+	bundleExec := "/Applications/Grailward Agent.app/Contents/MacOS/grailward-agent"
+	current := launchAgentPlist(bundleExec)
+
+	// A v0.5.0-style plist: identical but for the missing association block.
+	old := strings.Replace(current,
+		"\t<key>AssociatedBundleIdentifiers</key>\n\t<array>\n\t\t<string>"+bundleIdentifier+"</string>\n\t</array>\n",
+		"", 1)
+	if old == current {
+		t.Fatal("test setup: association block was not present to strip")
+	}
+	if launchAgentUpToDate(old, bundleExec) {
+		t.Fatal("a plist missing AssociatedBundleIdentifiers must read as out of date")
+	}
+	if !launchAgentUpToDate(current, bundleExec) {
+		t.Fatal("the freshly generated plist must read as up to date")
+	}
+}
+
+// TestSetStartAtLoginLogsTarget: a successful toggle logs the outcome in both
+// directions, and the enable line names the real login-item target.
+func TestSetStartAtLoginLogsTarget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+
+	var buf bytes.Buffer
+	orig, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() { log.SetOutput(orig); log.SetFlags(flags) }()
+
+	const target = "/Users/tester/Library/LaunchAgents/com.grailward.agent.plist"
+	w := &Watcher{
+		Config:           &Config{},
+		enableLoginItem:  func(string) error { return nil },
+		disableLoginItem: func() error { return nil },
+		loginItemTarget:  func() string { return target },
+	}
+
+	if err := w.SetStartAtLogin(true); err != nil {
+		t.Fatalf("SetStartAtLogin(true): %v", err)
+	}
+	if want := "Start with system enabled — login item at " + target; !strings.Contains(buf.String(), want) {
+		t.Fatalf("enable log missing %q in:\n%s", want, buf.String())
+	}
+
+	buf.Reset()
+	if err := w.SetStartAtLogin(false); err != nil {
+		t.Fatalf("SetStartAtLogin(false): %v", err)
+	}
+	if want := "Start with system disabled — login item removed"; !strings.Contains(buf.String(), want) {
+		t.Fatalf("disable log missing %q in:\n%s", want, buf.String())
 	}
 }
 

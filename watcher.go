@@ -115,6 +115,7 @@ type Watcher struct {
 	// struct-literal Watcher (tests) stays safe.
 	enableLoginItem  func(execPath string) error
 	disableLoginItem func() error
+	loginItemTarget  func() string
 
 	// Self-update seams + config. updateURL/updateHTTP/currentVersion default to the
 	// production manifest URL, the default HTTP client, and the embedded build
@@ -154,6 +155,7 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 		gameRunning:      GameLikelyRunning,
 		enableLoginItem:  enableStartAtLogin,
 		disableLoginItem: disableStartAtLogin,
+		loginItemTarget:  startAtLoginTarget,
 		currentVersion:   Version,
 		confirmUpdate:    ConfirmUpdate,
 		applyUpdate:      ApplyUpdate,
@@ -383,6 +385,11 @@ func (w *Watcher) SetMapSync(on bool) {
 		// sidecar latch — drop every one now so none stays red forever.
 		w.clearErrsFunc(func(key string) bool { return strings.HasPrefix(key, sidecarErrPrefix) })
 	}
+	if on {
+		log.Print("Sync map exploration enabled")
+	} else {
+		log.Print("Sync map exploration disabled")
+	}
 	w.persistConfig()
 }
 
@@ -413,6 +420,7 @@ func (w *Watcher) SetStartAtLogin(on bool) error {
 		if err := enable(exec); err != nil {
 			return err
 		}
+		log.Printf("Start with system enabled — login item at %s", w.loginItemTargetPath())
 	} else {
 		disable := w.disableLoginItem
 		if disable == nil {
@@ -421,12 +429,24 @@ func (w *Watcher) SetStartAtLogin(on bool) error {
 		if err := disable(); err != nil {
 			return err
 		}
+		log.Print("Start with system disabled — login item removed")
 	}
 	w.mu.Lock()
 	w.Config.StartAtLogin = on
 	w.mu.Unlock()
 	w.persistConfig()
 	return nil
+}
+
+// loginItemTargetPath describes where the OS login item lives (the LaunchAgent
+// plist path on macOS, the HKCU Run value on Windows), used only for the enable log
+// line. Nil-safe so a struct-literal Watcher in tests falls back to the real seam.
+func (w *Watcher) loginItemTargetPath() string {
+	target := w.loginItemTarget
+	if target == nil {
+		target = startAtLoginTarget
+	}
+	return target()
 }
 
 // SavesDir returns the folder currently being watched. It is read under w.mu
@@ -448,6 +468,11 @@ func (w *Watcher) SetSyncMode(mode string) {
 	w.mu.Lock()
 	w.Config.SyncMode = mode
 	w.mu.Unlock()
+	if mode == SyncModeTwoWay {
+		log.Print("Sync mode set to two-way")
+	} else {
+		log.Print("Sync mode set to push-only")
+	}
 	w.persistConfig()
 	if mode == SyncModeTwoWay {
 		w.RequestPull()
@@ -506,6 +531,7 @@ func (w *Watcher) SetInterval(seconds float64) {
 	w.Config.PollInterval = seconds
 	w.mu.Unlock()
 	w.wake()
+	log.Printf("Poll interval set to %gs", seconds)
 	w.persistConfig()
 }
 
