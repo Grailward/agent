@@ -58,11 +58,22 @@ type Watcher struct {
 	paused     bool
 	interval   time.Duration
 	newerCount int
-	reset      chan struct{} // wakes the loop when interval/pause changes
-	pullReq    chan struct{} // requests an interactive pull on the scan goroutine
-	changeDir  chan string   // requests a live saves-folder swap on the scan goroutine
-	onStatus   StatusFunc
-	onNewer    NewerFunc
+
+	// errs is the persistent pull-error latch: a per-scope error message that
+	// only its own successful operation clears — a routine healthy scan never
+	// does. The tray derives its red state from a non-empty latch, so a failed
+	// manifest fetch / download / sidecar carry stays visible until it recovers
+	// instead of being painted over by the next "Watching for changes". Both the
+	// scan goroutine (setErr/clearErr on pull outcomes) and the tray goroutine
+	// (clearErrs/clearErrsFunc on mode & map-sync toggles) write it, so every
+	// access is guarded by w.mu.
+	errs map[string]string
+
+	reset     chan struct{} // wakes the loop when interval/pause changes
+	pullReq   chan struct{} // requests an interactive pull on the scan goroutine
+	changeDir chan string   // requests a live saves-folder swap on the scan goroutine
+	onStatus  StatusFunc
+	onNewer   NewerFunc
 
 	// persistMu serializes config.json writes so concurrent preference changes
 	// (interval / sync mode / token, driven from different tray goroutines)
@@ -88,6 +99,7 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 		Pending:         make(map[string]FileStat),
 		Uploaded:        make(map[string]string),
 		lastLine:        make(map[string]string),
+		errs:            make(map[string]string),
 		pendingSidecars: make(map[string]string),
 		Machine:         hostname,
 		syncState:       LoadSyncState(statePath),
@@ -112,10 +124,108 @@ func (w *Watcher) SetStatusFunc(f StatusFunc) {
 func (w *Watcher) status(state State, message string) {
 	w.mu.Lock()
 	f := w.onStatus
+	// Error latch: an active persistent error overrides a healthy "syncing"
+	// report so a routine scan can't paint over it (the whole point of the
+	// latch). A Paused report is explicit user intent and passes through; an
+	// error report obviously passes through too.
+	if state == StateSyncing && len(w.errs) > 0 {
+		state = StateError
+		message = w.errSummaryLocked()
+	}
 	w.mu.Unlock()
 	if f != nil {
 		f(state, message)
 	}
+}
+
+// errSummaryLocked renders the tray line for the current latch. The caller holds
+// w.mu. A single error shows its own message; several collapse to a count so the
+// tray stays readable and the per-error detail lives in the log.
+func (w *Watcher) errSummaryLocked() string {
+	switch len(w.errs) {
+	case 0:
+		return "Watching for changes"
+	case 1:
+		for _, m := range w.errs {
+			return m
+		}
+	}
+	return fmt.Sprintf("%d pending sync errors — see log", len(w.errs))
+}
+
+// setErr latches a persistent error under key and paints the tray red. Only
+// clearErr(key) (or clearErrs/clearErrsFunc) removes it — never a routine scan.
+// setErr is always called from the scan goroutine, but the latch is shared with
+// tray-goroutine clearers, so w.mu guards every touch.
+func (w *Watcher) setErr(key, message string) {
+	w.mu.Lock()
+	if w.errs == nil {
+		w.errs = make(map[string]string)
+	}
+	w.errs[key] = message
+	f := w.onStatus
+	msg := w.errSummaryLocked()
+	w.mu.Unlock()
+	if f != nil {
+		f(StateError, msg)
+	}
+}
+
+// clearErr removes one latched error (the equivalent operation succeeded). If it
+// actually cleared something it re-renders: back to the remaining error summary,
+// or to the normal syncing/paused line once the latch is empty. A no-op key
+// (never latched) renders nothing, so healthy runs stay quiet.
+func (w *Watcher) clearErr(key string) {
+	w.mu.Lock()
+	_, existed := w.errs[key]
+	delete(w.errs, key)
+	state, msg := w.deriveIdleLocked()
+	f := w.onStatus
+	w.mu.Unlock()
+	if existed && f != nil {
+		f(state, msg)
+	}
+}
+
+// clearErrs drops every latched error and re-renders once. Used when the whole
+// latch is meaningless for the new world — switching to push-only (never pulls)
+// or swapping the saves folder — so a stale latch can't leave the tray red.
+func (w *Watcher) clearErrs() {
+	w.clearErrsFunc(func(string) bool { return true })
+}
+
+// clearErrsFunc drops every latched error whose key satisfies drop, re-rendering
+// once if anything changed (to the remaining error summary, or the idle
+// syncing/paused line). It may run on the scan or the tray goroutine; w.mu guards
+// the map. Deleting during the range is allowed by the language spec.
+func (w *Watcher) clearErrsFunc(drop func(key string) bool) {
+	w.mu.Lock()
+	changed := false
+	for key := range w.errs {
+		if drop(key) {
+			delete(w.errs, key)
+			changed = true
+		}
+	}
+	state, msg := w.deriveIdleLocked()
+	f := w.onStatus
+	w.mu.Unlock()
+	if changed && f != nil {
+		f(state, msg)
+	}
+}
+
+// deriveIdleLocked returns the state/message to show when no specific report is
+// in flight: the remaining error summary if the latch is non-empty, otherwise the
+// paused line or the normal watching line. Caller holds w.mu.
+func (w *Watcher) deriveIdleLocked() (State, string) {
+	if len(w.errs) > 0 {
+		return StateError, w.errSummaryLocked()
+	}
+	if w.paused {
+		return StatePaused, "Sync paused"
+	}
+	return StateSyncing, "Watching for changes"
 }
 
 // SetNewerFunc registers the callback used to report the count of newer server
@@ -165,6 +275,11 @@ func (w *Watcher) SetMapSync(on bool) {
 	v := on
 	w.Config.SyncMapFiles = &v
 	w.mu.Unlock()
+	if !on {
+		// With map sync off, applySidecars early-returns and can no longer clear a
+		// sidecar latch — drop every one now so none stays red forever.
+		w.clearErrsFunc(func(key string) bool { return strings.HasPrefix(key, sidecarErrPrefix) })
+	}
 	w.persistConfig()
 }
 
@@ -191,6 +306,9 @@ func (w *Watcher) SetSyncMode(mode string) {
 	if mode == SyncModeTwoWay {
 		w.RequestPull()
 	} else {
+		// Push-only never pulls, so no pull error can be produced or resolved
+		// here — drop any latched ones so the tray doesn't stay red forever.
+		w.clearErrs()
 		w.setNewer(0)
 		w.status(StateSyncing, "Watching for changes")
 	}
@@ -385,6 +503,10 @@ func (w *Watcher) applyDirChange(dir string) bool {
 	clear(w.Pending)
 	clear(w.Uploaded)
 	clear(w.lastLine)
+	// The new folder is a fresh world — old-folder errors are meaningless. Drop
+	// the whole latch so it can't repaint red under the "Saves folder changed"
+	// line; any real problem re-latches on the next cycle.
+	w.clearErrs()
 
 	log.Printf("Saves folder changed: %s -> %s", old, dir)
 	w.persistConfig()

@@ -63,7 +63,7 @@ func TestEvaluateClassifiesManifest(t *testing.T) {
 		syncState: state,
 	}
 
-	cands, err := w.evaluate()
+	cands, _, err := w.evaluate()
 	if err != nil {
 		t.Fatalf("evaluate failed: %v", err)
 	}

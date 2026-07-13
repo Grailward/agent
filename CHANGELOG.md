@@ -7,6 +7,22 @@ release are published at [grailward.com/download](https://grailward.com/download
 Versions up to v0.2.0 predate this public mirror, so they have no corresponding
 source snapshot here; they are listed for completeness.
 
+## v0.4.1 — 2026-07-13
+
+- **Sync errors now stay visible.** A failed download — the sync manifest, a save
+  pull, or map-reveal files — turns the tray red and keeps it red until that same
+  operation succeeds. Routine healthy scans no longer clear the error silently,
+  and a failure on one character is never masked by another character syncing
+  fine right after. With several pending errors the tooltip shows a count
+  ("N pending sync errors — see log").
+- Every applied pull now writes a log line with the file's short checksum, so
+  repeated pulls of the same character are always visible in the log (previously
+  an identical success line could be deduplicated away).
+- macOS: the "game open" write guard now matches the real game process
+  (`D2R.exe`) and ignores leftover CrossOver/Wine engine processes that could
+  block writes unnecessarily. Writes are still refused whenever a real game
+  session looks active.
+
 ## v0.4.0 — 2026-07-10
 
 - **Map exploration sync.** The fog-of-war "reveal" files that Diablo II:

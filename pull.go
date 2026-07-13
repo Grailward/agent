@@ -13,6 +13,20 @@ import (
 	"time"
 )
 
+// errKeyManifest is the error-latch key shared by the periodic check and the
+// on-demand pull for the manifest fetch. A fetch failure latches it; the next
+// successful fetch — or a deliberately disabled server — clears it.
+const errKeyManifest = "__manifest__"
+
+// sidecarErrPrefix namespaces the per-character sidecar error-latch keys so they
+// can be cleared as a group (e.g. when map sync is switched off).
+const sidecarErrPrefix = "__sidecar__"
+
+// sidecarErrKey is the per-character error-latch key for a map-sidecar carry, so
+// one character's failed carry never masks another's (mirrors the per-file save
+// keying).
+func sidecarErrKey(d2sName string) string { return sidecarErrPrefix + d2sName }
+
 // candidate is one manifest file the pull may act on, with its classification.
 type candidate struct {
 	entry    ManifestEntry
@@ -84,20 +98,24 @@ func (w *Watcher) backupsDir() string {
 // evaluate fetches the manifest and classifies every entry against the local
 // files and the recorded sync state. It returns the files that are candidates
 // for a pull (fast-forwards, new-from-server, conflicts); in-sync files are
-// recorded and plain local edits are left to the scan loop.
-func (w *Watcher) evaluate() ([]candidate, error) {
+// recorded and plain local edits are left to the scan loop. The second return is
+// the set of sanitized filenames the manifest actually lists, so the caller can
+// prune latched errors for files the server no longer knows about.
+func (w *Watcher) evaluate() ([]candidate, map[string]bool, error) {
 	m, err := w.Client.FetchManifest()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mapSync := w.MapSyncEnabled()
 	var cands []candidate
+	known := make(map[string]bool)
 	for _, e := range m.entries() {
 		clean, ok := sanitizeFilename(e.Filename)
 		if !ok {
 			w.logOnce("__reject__"+e.Filename, "Ignoring unsafe filename from server: "+e.Filename)
 			continue
 		}
+		known[clean] = true
 		localSHA, present := w.localSHA(clean)
 		lastSync := w.lastSyncSHA(clean)
 		switch decide(present, localSHA, lastSync, e.SHA256) {
@@ -119,7 +137,7 @@ func (w *Watcher) evaluate() ([]candidate, error) {
 			cands = append(cands, candidate{entry: e, decision: DecisionConflict, filename: clean})
 		}
 	}
-	return cands, nil
+	return cands, known, nil
 }
 
 // newerCount counts the candidates that represent a newer save on the server —
@@ -166,17 +184,20 @@ func (w *Watcher) periodicSyncCheck() {
 	if w.Paused() || w.SyncMode() != SyncModeTwoWay {
 		return
 	}
-	cands, err := w.evaluate()
+	cands, _, err := w.evaluate()
 	if err != nil {
 		var pd *PullDisabledError
 		if errors.As(err, &pd) {
 			w.logOnce("__pull__", "Server pull is disabled: "+pd.Message)
+			w.clearErr(errKeyManifest) // a disabled server is a state, not a failure
 			w.setNewer(0)
 		} else {
 			w.logOnce("__pull__", "Could not check the server for newer saves: "+err.Error())
+			w.setErr(errKeyManifest, "Cannot reach server for pull")
 		}
 		return
 	}
+	w.clearErr(errKeyManifest) // the manifest fetch succeeded
 	n := newerCount(cands)
 	w.setNewer(n)
 	if n > 0 {
@@ -187,7 +208,7 @@ func (w *Watcher) periodicSyncCheck() {
 // refreshNewer recomputes the newer-save count without any dialog, swallowing
 // transient errors (used to update the badge after a pull run).
 func (w *Watcher) refreshNewer() {
-	if cands, err := w.evaluate(); err == nil {
+	if cands, _, err := w.evaluate(); err == nil {
 		w.setNewer(newerCount(cands))
 	}
 }
@@ -200,11 +221,13 @@ func (w *Watcher) runPull() {
 		return
 	}
 	w.ensureSeams()
-	cands, err := w.evaluate()
+	cands, known, err := w.evaluate()
 	if err != nil {
 		w.reportPullError(err)
 		return
 	}
+	w.clearErr(errKeyManifest) // the manifest fetch succeeded
+	w.pruneFileErrs(known)     // forget latches for files the server dropped
 
 	var batch, conflicts, sidecarOnly []candidate
 	for _, c := range cands {
@@ -277,12 +300,13 @@ func (w *Watcher) reportPullError(err error) {
 	var pd *PullDisabledError
 	if errors.As(err, &pd) {
 		w.logOnce("__pull__", "Server pull is disabled: "+pd.Message)
+		w.clearErr(errKeyManifest) // a disabled server is a state, not a failure
 		w.status(StateSyncing, "Server pull disabled")
 		w.setNewer(0)
 		return
 	}
 	w.logOnce("__pull__", "Could not reach the server for pull: "+err.Error())
-	w.status(StateError, "Cannot reach server for pull")
+	w.setErr(errKeyManifest, "Cannot reach server for pull")
 }
 
 // applyCandidate downloads and writes one server save (a fast-forward or a new
@@ -294,16 +318,19 @@ func (w *Watcher) applyCandidate(c candidate, before time.Time) {
 	data, xsha, err := w.Client.Download(c.entry.DownloadPath)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": download failed — "+err.Error())
-		w.status(StateError, c.filename+": download failed")
+		w.setErr(c.filename, c.filename+": download failed")
 		return
 	}
 	if err := pullWrite(w.SavesDir(), w.backupsDir(), c.filename, data, c.entry.SHA256, xsha); err != nil {
 		w.logOnce(c.filename, c.filename+": pull aborted — "+err.Error())
-		w.status(StateError, c.filename+": pull aborted")
+		w.setErr(c.filename, c.filename+": pull aborted")
 		return
 	}
 	w.recordPulled(c.filename, c.entry.SHA256)
-	w.logOnce(c.filename, c.filename+": pulled from server")
+	w.clearErr(c.filename) // this file's pull succeeded — drop its latched error
+	// The short sha keeps each applied pull a distinct log line, so a later pull
+	// of the same file (different bytes) is never swallowed by the logOnce dedup.
+	w.logOnce(c.filename, c.filename+": pulled from server ("+shortSHA(c.entry.SHA256)+")")
 	w.status(StateSyncing, "Pulled "+c.filename)
 	// The map-exploration sidecars ride along with the character save.
 	w.applySidecars(c, before)
@@ -343,6 +370,7 @@ func (w *Watcher) applySidecars(c candidate, before time.Time) {
 		want[clean] = s.SHA256
 	}
 	if len(want) == 0 {
+		w.clearErr(sidecarErrKey(c.filename)) // sidecars are in sync
 		return
 	}
 
@@ -354,6 +382,7 @@ func (w *Watcher) applySidecars(c candidate, before time.Time) {
 	resp, err := w.Client.DownloadSidecars(c.entry.SidecarsDownloadPath)
 	if err != nil {
 		w.logOnce("__sidecar__"+c.filename, c.filename+": sidecar download failed — "+err.Error())
+		w.setErr(sidecarErrKey(c.filename), c.filename+": map sidecar download failed")
 		return
 	}
 	for _, f := range resp.Files {
@@ -381,8 +410,10 @@ func (w *Watcher) applySidecars(c candidate, before time.Time) {
 			continue
 		}
 		w.recordPulled(clean, manifestSHA)
-		w.logOnce("__sidecar__"+clean, clean+": map sidecar pulled from server")
+		w.logOnce("__sidecar__"+clean, clean+": map sidecar pulled from server ("+shortSHA(manifestSHA)+")")
 	}
+	// The sidecar batch was fetched and applied — clear this character's latch.
+	w.clearErr(sidecarErrKey(c.filename))
 }
 
 // useServer resolves a conflict in the server's favor: the local bytes are
@@ -396,7 +427,7 @@ func (w *Watcher) useServer(c candidate, before time.Time) {
 	localBytes, err := os.ReadFile(dest)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": cannot read local file to back up — "+err.Error())
-		w.status(StateError, c.filename+": conflict aborted")
+		w.setErr(c.filename, c.filename+": conflict aborted")
 		return
 	}
 	sum := sha256.Sum256(localBytes)
@@ -405,12 +436,12 @@ func (w *Watcher) useServer(c candidate, before time.Time) {
 	resp, err := w.Client.UploadSnapshotBackup(c.filename, localBytes, localSHA, w.Machine)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": backup upload failed — "+err.Error())
-		w.status(StateError, c.filename+": conflict aborted")
+		w.setErr(c.filename, c.filename+": conflict aborted")
 		return
 	}
 	if resp.Error != "" {
 		w.logOnce(c.filename, c.filename+": backup upload rejected — "+resp.Error)
-		w.status(StateError, c.filename+": conflict aborted")
+		w.setErr(c.filename, c.filename+": conflict aborted")
 		return
 	}
 	// Local bytes are safe on the server; now overwrite with the server copy.
@@ -425,11 +456,17 @@ func (w *Watcher) pushLocalNow(c candidate) {
 	data, err := os.ReadFile(dest)
 	if err != nil {
 		w.logOnce(c.filename, c.filename+": cannot read local file to push — "+err.Error())
-		w.status(StateError, c.filename+": push aborted")
+		w.setErr(c.filename, c.filename+": push aborted")
 		return
 	}
 	sum := sha256.Sum256(data)
-	w.upload(c.filename, dest, data, hex.EncodeToString(sum[:]))
+	sha := hex.EncodeToString(sum[:])
+	w.upload(c.filename, dest, data, sha)
+	// A successful upload (Uploaded advanced to this sha) resolves the conflict
+	// in local's favour — drop any latched error for this file.
+	if w.Uploaded[dest] == sha {
+		w.clearErr(c.filename)
+	}
 }
 
 // recordPulled updates the sync state and the watcher's own maps after a
@@ -469,6 +506,31 @@ func (w *Watcher) ensureSeams() {
 	if w.gameRunning == nil {
 		w.gameRunning = GameLikelyRunning
 	}
+}
+
+// pruneFileErrs drops per-file (and their matching sidecar) latches for files
+// that are no longer in the manifest, so a save deleted server-side can't leave
+// the tray red forever with no operation left to clear it. known is the set of
+// sanitized filenames the just-fetched manifest listed. The manifest latch is
+// exempt — it has its own heal cycle (a later successful fetch clears it).
+func (w *Watcher) pruneFileErrs(known map[string]bool) {
+	w.clearErrsFunc(func(key string) bool {
+		if key == errKeyManifest {
+			return false
+		}
+		name := strings.TrimPrefix(key, sidecarErrPrefix) // no-op for plain per-file keys
+		return !known[name]
+	})
+}
+
+// shortSHA returns the first 7 hex chars of a sha256 (git-style), used to make
+// each applied-pull log line distinct so the logOnce dedup doesn't suppress a
+// second, genuinely-different pull of the same file.
+func shortSHA(sha string) string {
+	if len(sha) < 7 {
+		return sha
+	}
+	return sha[:7]
 }
 
 // candidateNames joins candidate filenames for a prompt.

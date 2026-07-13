@@ -41,6 +41,33 @@ func TestEscapeAppleScript(t *testing.T) {
 	}
 }
 
+// TestMatchesGameProcess pins the hardened game-process pattern: it must match
+// the real "D2R.exe" binary (however the CrossOver/Wine command line spells its
+// path) but never the "D2R-CXEngine" helper, which lingers as a wine leftover and
+// would otherwise keep the write guard tripped forever.
+func TestMatchesGameProcess(t *testing.T) {
+	tests := []struct {
+		name    string
+		cmdline string
+		want    bool
+	}{
+		{"bare exe", "D2R.exe", true},
+		{"windows path with args", `C:\Program Files (x86)\Diablo II Resurrected\D2R.exe -launch`, true},
+		{"crossover unix path to exe", "/Users/x/Library/Application Support/CrossOver/Bottles/Battle.net/drive_c/Program Files (x86)/Diablo II Resurrected/D2R.exe", true},
+		{"crossover engine leftover", "D2R-CXEngine", false},
+		{"crossover engine leftover with path", "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/D2R-CXEngine", false},
+		{"unrelated process", "SomeOtherApp --flag", false},
+		{"bare D2R without exe", "D2R", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchesGameProcess(tt.cmdline); got != tt.want {
+				t.Fatalf("matchesGameProcess(%q) = %v, want %v", tt.cmdline, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRecentlySavedExcludesInRunWrites guards the fix for the batch self-trigger:
 // the mtime heuristic must count a save modified before the pull run began (real
 // game activity) but ignore one modified after it began (the agent's own write).

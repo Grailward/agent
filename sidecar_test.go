@@ -403,7 +403,7 @@ func TestSidecarOnlyPullIsSilentAndUncounted(t *testing.T) {
 	}
 
 	// The sidecar-only carry must not count as a newer save.
-	cands, err := w.evaluate()
+	cands, _, err := w.evaluate()
 	if err != nil {
 		t.Fatalf("evaluate failed: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestSidecarOnlyToggleOff(t *testing.T) {
 	off := false
 	w.Config.SyncMapFiles = &off
 
-	cands, err := w.evaluate()
+	cands, _, err := w.evaluate()
 	if err != nil {
 		t.Fatalf("evaluate failed: %v", err)
 	}
