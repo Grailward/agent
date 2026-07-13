@@ -102,7 +102,21 @@ func startAtLoginTarget() string {
 // Returns true only when the user explicitly chooses Update.
 func ConfirmUpdate(version string) (bool, error) {
 	msg := fmt.Sprintf("A new version of Grailward Agent (%s) is available.\n\nGrailward will download it, replace this copy, and restart. Update now?", version)
-	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent — Update" buttons {"Later", "Update"} default button "Update" with icon note)`, escapeAppleScript(msg))
+	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent — Update" buttons {"Later", "Update"} default button "Update"%s)`, escapeAppleScript(msg), dialogIconClause())
+	out, err := runOsascript(script)
+	if err != nil {
+		return false, nil // dismissed == Later
+	}
+	return strings.TrimSpace(out) == "Update", nil
+}
+
+// ConfirmUpdateFound shows the two-button confirmation for a user-initiated check
+// that found a newer version. Its "Update now?" IS the apply confirmation, so the
+// manual flow never opens a second dialog. Returns true only when the user chooses
+// Update.
+func ConfirmUpdateFound(newVer, curVer string) (bool, error) {
+	msg := fmt.Sprintf("Version %s is available (you have %s). Update now?", newVer, curVer)
+	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent — Update" buttons {"Later", "Update"} default button "Update"%s)`, escapeAppleScript(msg), dialogIconClause())
 	out, err := runOsascript(script)
 	if err != nil {
 		return false, nil // dismissed == Later
@@ -326,7 +340,7 @@ func OpenPath(path string) error {
 // PromptToken displays an AppleScript text input dialog for the token.
 func PromptToken(url string) (string, error) {
 	escapedURL := strings.ReplaceAll(strings.ReplaceAll(url, "\\", "\\\\"), "\"", "\\\"")
-	script := fmt.Sprintf(`text returned of (display dialog "Please enter your Grailward API Token for: %s" default answer "" with title "Grailward Agent Setup" with icon note buttons {"Cancel", "OK"} default button "OK")`, escapedURL)
+	script := fmt.Sprintf(`text returned of (display dialog "Please enter your Grailward API Token for: %s" default answer "" with title "Grailward Agent Setup"%s buttons {"Cancel", "OK"} default button "OK")`, escapedURL, dialogIconClause())
 
 	cmd := exec.Command("osascript", "-e", script)
 	var out bytes.Buffer
@@ -371,6 +385,49 @@ func escapeAppleScript(s string) string {
 	return s
 }
 
+// escapeAppleScriptPath escapes a filesystem path for a double-quoted AppleScript
+// string literal (POSIX file "…"): only backslash and quote need escaping — a path
+// never carries the newline that escapeAppleScript rewrites.
+func escapeAppleScriptPath(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	return s
+}
+
+// dialogIconClause returns the AppleScript ` with icon POSIX file "…"` fragment
+// pointing at the running bundle's AppIcon.icns, appended to every display-dialog
+// script so the native dialogs carry the grailward shield instead of a generic
+// icon. It returns "" for a raw binary (no bundle) or a missing icon so the dialog
+// falls back to its default rather than breaking.
+func dialogIconClause() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return dialogIconClauseFor(exe)
+}
+
+// dialogIconClauseFor is the pure core of dialogIconClause: it derives the bundle's
+// AppIcon.icns from execPath (single source: macUpdateTarget) and returns the
+// escaped ` with icon …` clause when that icon exists, or "" otherwise. Split out
+// from os.Executable so the clause is unit-testable against a temp bundle.
+func dialogIconClauseFor(execPath string) string {
+	bundle, ok := macUpdateTarget(execPath)
+	if !ok {
+		return ""
+	}
+	icns := filepath.Join(bundle, "Contents", "Resources", "AppIcon.icns")
+	if _, err := os.Stat(icns); err != nil {
+		return ""
+	}
+	// A path with a newline would malform the AppleScript and break the WHOLE
+	// dialog (not just the icon) — better a shieldless dialog than none.
+	if strings.ContainsAny(icns, "\n\r") {
+		return ""
+	}
+	return ` with icon POSIX file "` + escapeAppleScriptPath(icns) + `"`
+}
+
 // runOsascript runs a one-line AppleScript and returns its stdout.
 func runOsascript(script string) (string, error) {
 	cmd := exec.Command("osascript", "-e", script)
@@ -384,7 +441,7 @@ func runOsascript(script string) (string, error) {
 
 // ShowAbout displays a simple informational dialog with a single OK button.
 func ShowAbout(message string) error {
-	script := fmt.Sprintf(`display dialog "%s" with title "Grailward Agent" buttons {"OK"} default button "OK" with icon note`, escapeAppleScript(message))
+	script := fmt.Sprintf(`display dialog "%s" with title "Grailward Agent" buttons {"OK"} default button "OK"%s`, escapeAppleScript(message), dialogIconClause())
 	_, err := runOsascript(script)
 	return err
 }
@@ -392,7 +449,7 @@ func ShowAbout(message string) error {
 // ConfirmPull shows a two-button confirmation for a batch pull. It returns true
 // only when the user explicitly chooses Pull; a dismissed dialog is a Skip.
 func ConfirmPull(message string) (bool, error) {
-	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent" buttons {"Skip", "Pull"} default button "Pull" with icon note)`, escapeAppleScript(message))
+	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent" buttons {"Skip", "Pull"} default button "Pull"%s)`, escapeAppleScript(message), dialogIconClause())
 	out, err := runOsascript(script)
 	if err != nil {
 		return false, nil
@@ -402,7 +459,7 @@ func ConfirmPull(message string) (bool, error) {
 
 // ResolveConflict shows a three-button choice for a conflicted file.
 func ResolveConflict(filename string) (ConflictChoice, error) {
-	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent — Conflict" buttons {"Skip", "Use server", "Keep local"} default button "Skip" with icon caution)`, escapeAppleScript(conflictMessage(filename)))
+	script := fmt.Sprintf(`button returned of (display dialog "%s" with title "Grailward Agent — Conflict" buttons {"Skip", "Use server", "Keep local"} default button "Skip"%s)`, escapeAppleScript(conflictMessage(filename)), dialogIconClause())
 	out, err := runOsascript(script)
 	if err != nil {
 		return ConflictSkip, nil

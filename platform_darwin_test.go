@@ -166,6 +166,63 @@ func TestEscapeAppleScript(t *testing.T) {
 	}
 }
 
+// TestDialogIconClause proves the AppleScript icon fragment points at the bundle's
+// AppIcon.icns only when the agent runs from a .app whose icon exists, and that a
+// special character in the path is escaped for the double-quoted literal.
+func TestDialogIconClause(t *testing.T) {
+	// A raw binary outside any bundle yields no clause.
+	if got := dialogIconClauseFor("/usr/local/bin/grailward-agent"); got != "" {
+		t.Fatalf("raw binary must yield no icon clause, got %q", got)
+	}
+
+	// A bundle layout: no clause until AppIcon.icns actually exists, then the escaped
+	// POSIX-file clause pointing at it.
+	root := t.TempDir()
+	res := filepath.Join(root, "Grailward Agent.app", "Contents", "Resources")
+	macos := filepath.Join(root, "Grailward Agent.app", "Contents", "MacOS")
+	if err := os.MkdirAll(res, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(macos, 0755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(macos, "grailward-agent")
+	if got := dialogIconClauseFor(exe); got != "" {
+		t.Fatalf("a bundle without AppIcon.icns must yield no clause, got %q", got)
+	}
+	icns := filepath.Join(res, "AppIcon.icns")
+	if err := os.WriteFile(icns, []byte("icns"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := dialogIconClauseFor(exe), ` with icon POSIX file "`+icns+`"`; got != want {
+		t.Fatalf("dialogIconClauseFor = %q, want %q", got, want)
+	}
+
+	// A quote in the bundle path must be escaped inside the clause.
+	qContents := filepath.Join(root, `od"d.app`, "Contents")
+	if err := os.MkdirAll(filepath.Join(qContents, "Resources"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(qContents, "MacOS"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(qContents, "Resources", "AppIcon.icns"), []byte("i"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	qClause := dialogIconClauseFor(filepath.Join(qContents, "MacOS", "grailward-agent"))
+	if !strings.Contains(qClause, `od\"d.app`) {
+		t.Fatalf("quote in bundle path not escaped: %q", qClause)
+	}
+}
+
+// TestEscapeAppleScriptPath proves a quote/backslash in an icns path is escaped so
+// the POSIX file literal stays well-formed.
+func TestEscapeAppleScriptPath(t *testing.T) {
+	if got, want := escapeAppleScriptPath(`/A "B"\c`), `/A \"B\"\\c`; got != want {
+		t.Fatalf("escapeAppleScriptPath = %q, want %q", got, want)
+	}
+}
+
 // TestMatchesGameProcess pins the hardened game-process pattern: it must match
 // the real "D2R.exe" binary (however the CrossOver/Wine command line spells its
 // path) but never the "D2R-CXEngine" helper, which lingers as a wine leftover and

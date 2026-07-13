@@ -32,6 +32,24 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output "1" } else { 
 	return strings.TrimSpace(out) == "1", nil
 }
 
+// ConfirmUpdateFound shows the OK/Cancel confirmation for a user-initiated check
+// that found a newer version (OK = Update, Cancel = Later). Its prompt IS the apply
+// confirmation, so the manual flow never opens a second dialog. Returns true only
+// when the user chooses Update.
+func ConfirmUpdateFound(newVer, curVer string) (bool, error) {
+	script := `
+Add-Type -AssemblyName System.Windows.Forms
+$r = [System.Windows.Forms.MessageBox]::Show($env:GW_MSG, "Grailward Agent - Update", [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output "1" } else { Write-Output "0" }
+`
+	msg := fmt.Sprintf("Version %s is available (you have %s). Update now?", newVer, curVer)
+	out, err := runPowerShell(script, "GW_MSG="+msg)
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(out) == "1", nil
+}
+
 // ApplyUpdate replaces the running .exe and relaunches. A running Windows binary
 // can't be overwritten but can be renamed, so the current exe is moved aside to
 // ".old" (removed on the next start) and the new bytes take its path. On success

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -251,8 +255,13 @@ func TestCheckForUpdateBrokenManifestSilent(t *testing.T) {
 }
 
 // TestCheckForUpdateDevBuildSkips: a non-semver build never even fetches the
-// manifest (it can't be older than a release, so there's nothing to offer).
+// manifest (it can't be older than a release, so there's nothing to offer), and it
+// logs the "disabled" decision exactly once — not on every cycle.
 func TestCheckForUpdateDevBuildSkips(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
 	hit := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit = true
@@ -265,12 +274,54 @@ func TestCheckForUpdateDevBuildSkips(t *testing.T) {
 	w.SetUpdateFunc(rec.fn)
 
 	w.checkForUpdate()
+	w.checkForUpdate() // a second cycle must NOT re-log the dev-build line
 
 	if hit {
 		t.Fatal("a dev build must not fetch the update manifest")
 	}
 	if rec.sawAvailable() {
 		t.Fatal("a dev build must never receive an update offer")
+	}
+	if got := strings.Count(buf.String(), "Update check disabled (dev build)"); got != 1 {
+		t.Fatalf("dev-build skip should log exactly once, logged %d times:\n%s", got, buf.String())
+	}
+}
+
+// TestCheckForUpdateLogsDecision: both decision paths log one line per check (no
+// dedup), naming the running and latest versions.
+func TestCheckForUpdateLogsDecision(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	// Up-to-date decision line.
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, manifestJSON("v0.5.0"))
+	}))
+	defer up.Close()
+	w := &Watcher{lastLine: map[string]string{}, errs: map[string]string{}, updateURL: up.URL, currentVersion: "v0.5.0"}
+	w.SetUpdateFunc(func(updateUIState, string) {})
+	if out, ver := w.checkForUpdate(); out != checkUpToDate || ver != "v0.5.0" {
+		t.Fatalf("checkForUpdate = (%v, %q), want (up-to-date, v0.5.0)", out, ver)
+	}
+	if !strings.Contains(buf.String(), "Update check: running v0.5.0, latest is v0.5.0 — up to date") {
+		t.Fatalf("up-to-date decision not logged:\n%s", buf.String())
+	}
+
+	buf.Reset()
+
+	// Newer decision line.
+	newer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, manifestJSON("v0.6.0"))
+	}))
+	defer newer.Close()
+	w2 := &Watcher{lastLine: map[string]string{}, errs: map[string]string{}, updateURL: newer.URL, currentVersion: "v0.5.0"}
+	w2.SetUpdateFunc(func(updateUIState, string) {})
+	if out, ver := w2.checkForUpdate(); out != checkNewer || ver != "v0.6.0" {
+		t.Fatalf("checkForUpdate = (%v, %q), want (newer, v0.6.0)", out, ver)
+	}
+	if !strings.Contains(buf.String(), "Update check: found v0.6.0 (running v0.5.0) — offering in the menu") {
+		t.Fatalf("newer decision not logged:\n%s", buf.String())
 	}
 }
 
@@ -447,5 +498,204 @@ func TestRunUpdateUserDeclines(t *testing.T) {
 
 	if applyCalled {
 		t.Fatal("apply must not run when the user declines")
+	}
+}
+
+// TestRunUpdateTranslocatedRefusesBeforeDownload: an app running from a translocated
+// read-only mount must refuse the update before downloading anything, show the
+// move-to-Applications dialog, and keep the offer for a retry.
+func TestRunUpdateTranslocatedRefusesBeforeDownload(t *testing.T) {
+	downloadHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloadHit = true
+		w.Write([]byte("bytes"))
+	}))
+	defer srv.Close()
+
+	var shown string
+	applyCalled := false
+	w := &Watcher{
+		Config:        &Config{SavesDir: t.TempDir()},
+		lastLine:      map[string]string{},
+		errs:          map[string]string{},
+		confirmUpdate: func(string) (bool, error) { return true, nil },
+		gameRunning:   func(string, time.Time) (bool, string) { return false, "" },
+		showMessage:   func(m string) error { shown = m; return nil },
+		execPath: func() (string, error) {
+			return "/private/var/folders/62/x/T/AppTranslocation/ABC/d/Grailward Agent.app/Contents/MacOS/grailward-agent", nil
+		},
+		applyUpdate: func(string, *UpdateFile, []byte) error { applyCalled = true; return nil },
+	}
+	w.setUpdateOffer("v0.6.0", &UpdateFile{OS: "darwin", SHA256: sha256hex([]byte("bytes")), URL: srv.URL + "/dl"})
+
+	w.runUpdate()
+
+	if downloadHit {
+		t.Fatal("a translocated app must refuse before downloading anything")
+	}
+	if applyCalled {
+		t.Fatal("a translocated app must not apply an update")
+	}
+	if !strings.Contains(shown, "Applications folder") {
+		t.Fatalf("translocation dialog missing move-to-Applications guidance: %q", shown)
+	}
+	w.mu.Lock()
+	state := w.updateState
+	w.mu.Unlock()
+	if state != updateAvailable {
+		t.Fatalf("the offer must be retained after a translocation deferral, got %v", state)
+	}
+}
+
+// manualUpdateServer serves a manifest advertising `version` (both platforms) whose
+// artifact URL points back at "/dl" on the same server, returning `artifact` with a
+// matching sha256. Everything is synthetic — never a real release.
+func manualUpdateServer(artifact []byte, version string) *httptest.Server {
+	sha := sha256hex(artifact)
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dl" {
+			w.Write(artifact)
+			return
+		}
+		base := "http://" + r.Host
+		fmt.Fprintf(w, `{
+          "version": %q,
+          "released_at": "2026-07-13T00:00:00Z",
+          "files": [
+            {"os":"darwin","arch":"universal","name":"grailward-agent-macos.zip","size":%d,"sha256":%q,"url":%q},
+            {"os":"windows","arch":"amd64","name":"grailward-agent-windows-amd64.exe","size":%d,"sha256":%q,"url":%q}
+          ]
+        }`, version, len(artifact), sha, base+"/dl", len(artifact), sha, base+"/dl")
+	}))
+}
+
+// TestRunManualCheckNewerOffersAndApplies: a manual check that finds a newer version
+// asks to update (with both versions), and accepting funnels into the shared apply
+// flow — no second confirmation — handing the verified bytes to apply.
+func TestRunManualCheckNewerOffersAndApplies(t *testing.T) {
+	artifact := []byte("brand-new-build-bytes")
+	srv := manualUpdateServer(artifact, "v0.6.0")
+	defer srv.Close()
+
+	var applied []byte
+	var gotNew, gotCur string
+	w := &Watcher{
+		Config:         &Config{SavesDir: t.TempDir()},
+		lastLine:       map[string]string{},
+		errs:           map[string]string{},
+		updateURL:      srv.URL,
+		currentVersion: "v0.5.0",
+		gameRunning:    func(string, time.Time) (bool, string) { return false, "" },
+		confirmUpdateFound: func(newVer, curVer string) (bool, error) {
+			gotNew, gotCur = newVer, curVer
+			return true, nil
+		},
+		applyUpdate: func(_ string, _ *UpdateFile, data []byte) error {
+			applied = append([]byte(nil), data...)
+			return nil
+		},
+	}
+	rec := &updateRec{}
+	w.SetUpdateFunc(rec.fn)
+
+	w.runManualCheck()
+
+	if gotNew != "v0.6.0" || gotCur != "v0.5.0" {
+		t.Fatalf("confirm dialog got (%q, %q), want (v0.6.0, v0.5.0)", gotNew, gotCur)
+	}
+	if string(applied) != string(artifact) {
+		t.Fatalf("apply did not receive the downloaded bytes: got %q", applied)
+	}
+	if !rec.sawAvailable() {
+		t.Fatal("a newer version must surface the tray offer")
+	}
+}
+
+// TestRunManualCheckNewerDeclineNoApply: declining the manual "Update now?" applies
+// nothing and keeps the offer.
+func TestRunManualCheckNewerDeclineNoApply(t *testing.T) {
+	srv := manualUpdateServer([]byte("bytes"), "v0.6.0")
+	defer srv.Close()
+
+	applyCalled := false
+	w := &Watcher{
+		Config:             &Config{SavesDir: t.TempDir()},
+		lastLine:           map[string]string{},
+		errs:               map[string]string{},
+		updateURL:          srv.URL,
+		currentVersion:     "v0.5.0",
+		gameRunning:        func(string, time.Time) (bool, string) { return false, "" },
+		confirmUpdateFound: func(string, string) (bool, error) { return false, nil },
+		applyUpdate:        func(string, *UpdateFile, []byte) error { applyCalled = true; return nil },
+	}
+	rec := &updateRec{}
+	w.SetUpdateFunc(rec.fn)
+
+	w.runManualCheck()
+
+	if applyCalled {
+		t.Fatal("declining the manual update must not apply anything")
+	}
+	if state, _ := rec.last(); state != updateAvailable {
+		t.Fatalf("the offer must be retained after a decline, got %v", state)
+	}
+}
+
+// TestRunManualCheckUpToDateDialog: a manual check with nothing newer shows the
+// "latest version" dialog and never surfaces an offer.
+func TestRunManualCheckUpToDateDialog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, manifestJSON("v0.5.0"))
+	}))
+	defer srv.Close()
+
+	var shown string
+	w := &Watcher{
+		Config:         &Config{SavesDir: t.TempDir()},
+		lastLine:       map[string]string{},
+		errs:           map[string]string{},
+		updateURL:      srv.URL,
+		currentVersion: "v0.5.0",
+		showMessage:    func(m string) error { shown = m; return nil },
+	}
+	rec := &updateRec{}
+	w.SetUpdateFunc(rec.fn)
+
+	w.runManualCheck()
+
+	if shown != "You're on the latest version (v0.5.0)." {
+		t.Fatalf("up-to-date dialog = %q", shown)
+	}
+	if rec.sawAvailable() {
+		t.Fatal("up-to-date must not surface an offer")
+	}
+}
+
+// TestRunManualCheckFailedDialog: a manual check that can't complete shows the
+// "see log" dialog and never latches a sync error.
+func TestRunManualCheckFailedDialog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `nope`)
+	}))
+	defer srv.Close()
+
+	var shown string
+	w := &Watcher{
+		Config:         &Config{SavesDir: t.TempDir()},
+		lastLine:       map[string]string{},
+		errs:           map[string]string{},
+		updateURL:      srv.URL,
+		currentVersion: "v0.5.0",
+		showMessage:    func(m string) error { shown = m; return nil },
+	}
+
+	w.runManualCheck()
+
+	if shown != "Could not check for updates — see log." {
+		t.Fatalf("failed dialog = %q", shown)
+	}
+	if w.errCount() != 0 {
+		t.Fatal("a manual check failure must never populate the sync-error latch")
 	}
 }

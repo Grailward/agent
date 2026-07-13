@@ -7,6 +7,28 @@ release are published at [grailward.com/download](https://grailward.com/download
 Versions up to v0.2.0 predate this public mirror, so they have no corresponding
 source snapshot here; they are listed for completeness.
 
+## v0.5.2 — 2026-07-13
+
+- **"Check for updates…" in the menu.** A new, always-visible menu item lets you
+  check for a newer version on demand instead of waiting for the periodic check. It
+  reports the result in a dialog: it offers to update when a newer version is out
+  (the same confirm-and-apply flow, with the game-open and checksum safeguards),
+  tells you when you're already on the latest version, or points you to the log when
+  the check couldn't complete.
+- **Update checks are written to the log.** Every check now records one line — up to
+  date, a newer version found and offered, or skipped on a development build — so a
+  glance at the log shows whether the last check ran and what it decided.
+- **Native dialogs show the grailward shield.** On macOS the dialogs (About, the
+  token prompt, the pull and update confirmations, and the new update check) now
+  display the grailward app icon instead of a generic system icon. The saves-folder
+  picker keeps the standard Finder chooser, which has no icon slot.
+- **Handles macOS "translocation" gracefully.** When macOS runs the app from a
+  temporary read-only location (which happens when you open it straight from the
+  download without moving it first), the agent now detects this and asks you to move
+  Grailward Agent to your Applications folder — instead of failing an update or
+  registering a broken "Start with system" entry that points at a path that
+  disappears on the next launch.
+
 ## v0.5.1 — 2026-07-13
 
 - **Preference changes are written to the log.** Turning **Start with system** on

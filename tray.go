@@ -135,6 +135,9 @@ func (t *tray) onReady() {
 	systray.AddSeparator()
 	t.mResetTok = systray.AddMenuItem("Reset token", "Clear the stored token and enter a new one")
 	mAbout := systray.AddMenuItem("About Grailward Agent", "Version and configuration details")
+	// On-demand update check: always visible, sits by About. Runs a check now and
+	// reports the outcome (newer / up to date / failed) in a native dialog.
+	mCheck := systray.AddMenuItem("Check for updates…", "Check now for a newer version")
 	// Self-update offer: hidden until a newer version is published, then shows
 	// "Update to vX.Y.Z…" (or "Update failed — see log" after a failed apply).
 	t.mUpdate = systray.AddMenuItem("Update", "Download and install the newest version, then restart")
@@ -182,6 +185,8 @@ func (t *tray) onReady() {
 				}
 			case <-mAbout.ClickedCh:
 				t.showAbout()
+			case <-mCheck.ClickedCh:
+				t.watcher.RequestCheck()
 			case <-t.mResetTok.ClickedCh:
 				t.resetToken()
 			case <-mQuit.ClickedCh:

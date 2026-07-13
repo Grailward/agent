@@ -55,6 +55,16 @@ const (
 	updateFailed                         // the last apply failed — show "see log"
 )
 
+// checkOutcome is the result of an update check. It drives the manual-check dialog;
+// the periodic and startup callers ignore it.
+type checkOutcome int
+
+const (
+	checkFailed   checkOutcome = iota // the check couldn't complete (detail in the log)
+	checkUpToDate                     // no newer version — already current
+	checkNewer                        // a newer version is available and now offered
+)
+
 // UpdateManifest mirrors the published release manifest served at
 // agent/latest/manifest.json on the downloads host.
 type UpdateManifest struct {
@@ -292,6 +302,17 @@ func (w *Watcher) RequestUpdate() {
 	}
 }
 
+// RequestCheck asks the scan goroutine to run a user-initiated update check and
+// report the outcome in a dialog. A non-blocking nudge, like RequestUpdate; running
+// it on the scan goroutine serializes it with the periodic check so the two never
+// race.
+func (w *Watcher) RequestCheck() {
+	select {
+	case w.checkReq <- struct{}{}:
+	default:
+	}
+}
+
 func (w *Watcher) manifestURL() string {
 	if w.updateURL != "" {
 		return w.updateURL
@@ -313,31 +334,40 @@ func (w *Watcher) buildVersion() string {
 	return Version
 }
 
-// checkForUpdate fetches the manifest and offers an update when it is strictly
-// newer. Runs on the scan goroutine. Failures are log-only and deduplicated; they
-// never touch the sync-error latch (an update problem is not a save problem).
-func (w *Watcher) checkForUpdate() {
+// checkForUpdate fetches the manifest, logs the decision, and offers an update when
+// it is strictly newer. It returns the outcome and the latest advertised version so
+// a manual check can report it in a dialog; the periodic and startup callers ignore
+// the return. Runs on the scan goroutine. Failures are log-only and deduplicated and
+// never touch the sync-error latch (an update problem is not a save problem). The two
+// decision lines (up to date / offering) are intentionally NOT deduplicated: the
+// check runs every 6h or on demand, so one line per check is a heartbeat, not spam.
+func (w *Watcher) checkForUpdate() (checkOutcome, string) {
+	current := w.buildVersion()
 	// A build whose version isn't semver (a local "dev" build) can never be newer
-	// than a release, so skip the network round-trip entirely.
-	if _, ok := parseSemver(w.buildVersion()); !ok {
-		return
+	// than a release, so skip the network round-trip entirely. Log the decision once
+	// (deduplicated) so a restart makes plain why no offer will ever appear.
+	if _, ok := parseSemver(current); !ok {
+		w.logOnce(updateLogKey, "Update check disabled (dev build)")
+		return checkFailed, ""
 	}
 	m, err := fetchUpdateManifest(w.manifestURL(), w.updateClient())
 	if err != nil {
 		w.logOnce(updateLogKey, "Update check failed: "+err.Error())
-		return
+		return checkFailed, ""
 	}
 	file, ok := selectUpdateFile(m, runtime.GOOS, runtime.GOARCH)
 	if !ok {
 		w.logOnce(updateLogKey, "Update manifest lists no artifact for this platform")
-		return
+		return checkFailed, ""
 	}
-	if !isNewer(m.Version, w.buildVersion()) {
+	if !isNewer(m.Version, current) {
+		log.Printf("Update check: running %s, latest is %s — up to date", current, m.Version)
 		w.clearUpdateOffer()
-		return
+		return checkUpToDate, m.Version
 	}
+	log.Printf("Update check: found %s (running %s) — offering in the menu", m.Version, current)
 	w.setUpdateOffer(m.Version, file)
-	w.logOnce(updateLogKey, "Update available: "+m.Version)
+	return checkNewer, m.Version
 }
 
 // setUpdateOffer stores a newer-version offer and shows the tray item. A
@@ -389,9 +419,9 @@ func (w *Watcher) currentUpdateOffer() (*UpdateFile, string) {
 	return w.updateOffer, w.updateOfferVer
 }
 
-// runUpdate performs the interactive update on the scan goroutine: confirm →
-// game-open guard → download → verify SHA-256 → platform apply (swap + restart).
-// Being on the scan goroutine means no save transfer is ever in flight here.
+// runUpdate performs the interactive update from the passive tray offer on the scan
+// goroutine: confirm → shared apply flow. Being on the scan goroutine means no save
+// transfer is ever in flight here.
 func (w *Watcher) runUpdate() {
 	w.ensureSeams()
 	file, version := w.currentUpdateOffer()
@@ -406,6 +436,65 @@ func (w *Watcher) runUpdate() {
 	}
 	if !ok {
 		w.logOnce(updateLogKey, "Update to "+version+" postponed by user")
+		return
+	}
+	w.applyOfferedUpdate()
+}
+
+// runManualCheck runs a user-initiated update check and reports the outcome in a
+// native dialog. It reuses checkForUpdate (same network path, same offer + decision
+// log); when a newer version is found, its "Update now?" dialog IS the apply
+// confirmation, so the manual flow never opens a second confirmation before entering
+// the shared apply path.
+func (w *Watcher) runManualCheck() {
+	w.ensureSeams()
+	outcome, latest := w.checkForUpdate()
+	switch outcome {
+	case checkNewer:
+		ok, err := w.confirmUpdateFound(latest, w.buildVersion())
+		if err != nil {
+			log.Printf("Update confirmation dialog failed: %v", err)
+			return
+		}
+		if !ok {
+			w.logOnce(updateLogKey, "Update to "+latest+" postponed by user")
+			return
+		}
+		w.applyOfferedUpdate()
+	case checkUpToDate:
+		w.notify(fmt.Sprintf("You're on the latest version (%s).", latest))
+	default: // checkFailed
+		w.notify("Could not check for updates — see log.")
+	}
+}
+
+// applyOfferedUpdate runs the shared apply flow for the current offer, assuming the
+// caller already confirmed it: resolve the executable → translocation guard →
+// game-open guard → download → verify SHA-256 → pre-swap game re-guard → platform
+// apply (swap + restart). This is the single apply path; both the passive offer and
+// the manual check funnel through it. On success the platform apply restarts the
+// process and does not return.
+func (w *Watcher) applyOfferedUpdate() {
+	file, version := w.currentUpdateOffer()
+	if file == nil {
+		return
+	}
+
+	// Resolve the executable up front: it drives both the translocation guard and
+	// the eventual swap, so a failure here aborts before anything is downloaded.
+	exe, err := w.resolveExecPath()
+	if err != nil {
+		w.logOnce(updateLogKey, "Update aborted: cannot resolve executable path: "+err.Error())
+		w.markUpdateFailed()
+		return
+	}
+
+	// macOS App Translocation: Gatekeeper runs a quarantined download from a
+	// read-only, ephemeral mount, so the swap can't stage beside the bundle there.
+	// Refuse before downloading and tell the user to move the app to Applications;
+	// keep the offer so a retry works once it's moved.
+	if isTranslocated(exe) {
+		w.deferUpdateForTranslocation()
 		return
 	}
 
@@ -425,13 +514,6 @@ func (w *Watcher) runUpdate() {
 	}
 	if err := checkSHA256(data, file.SHA256); err != nil {
 		w.logOnce(updateLogKey, "Update checksum mismatch for "+version+": "+err.Error())
-		w.markUpdateFailed()
-		return
-	}
-
-	exe, err := currentExecPath()
-	if err != nil {
-		w.logOnce(updateLogKey, "Update aborted: cannot resolve executable path: "+err.Error())
 		w.markUpdateFailed()
 		return
 	}
@@ -458,9 +540,28 @@ func (w *Watcher) runUpdate() {
 // can retry. Nothing is applied.
 func (w *Watcher) deferUpdateForGame(reason string) {
 	log.Printf("Update deferred: %s.", reason)
-	notify := w.showMessage
-	if notify == nil {
-		notify = ShowAbout
+	w.notify("Grailward can't update while Diablo II: Resurrected is running.\n\nClose the game, then choose Update again.")
+}
+
+// deferUpdateForTranslocation refuses an update when macOS runs the app from a
+// translocated read-only location, where the swap can't write beside the bundle. It
+// logs, tells the user to move the app to Applications, and keeps the offer for a
+// retry once it's moved. Nothing is downloaded or applied.
+func (w *Watcher) deferUpdateForTranslocation() {
+	log.Print("Update deferred: the app is running from a translocated read-only location; move it to Applications and retry.")
+	w.notify("macOS is running this app from a temporary read-only location.\n\nMove Grailward Agent to your Applications folder with Finder, reopen it, and try the update again.")
+}
+
+// notify shows an informational message through the showMessage seam, falling back
+// to the platform dialog when the seam is unset (a struct-literal Watcher in tests).
+// The seam is only ever assigned at construction, so this is safe to call from the
+// tray goroutine as well as the scan goroutine.
+func (w *Watcher) notify(message string) {
+	f := w.showMessage
+	if f == nil {
+		f = ShowAbout
 	}
-	_ = notify("Grailward can't update while Diablo II: Resurrected is running.\n\nClose the game, then choose Update again.")
+	if err := f(message); err != nil {
+		log.Printf("Could not show dialog: %v", err)
+	}
 }

@@ -83,6 +83,94 @@ func TestStartAtLoginNeedsHeal(t *testing.T) {
 	}
 }
 
+// TestIsTranslocated distinguishes a real App Translocation path (a read-only,
+// per-launch-ephemeral mount) from a normal install path.
+func TestIsTranslocated(t *testing.T) {
+	translocated := []string{
+		"/private/var/folders/62/abc/T/AppTranslocation/A887B1/d/Grailward Agent.app/Contents/MacOS/grailward-agent",
+		"/var/folders/xy/z/AppTranslocation/UUID/d/Grailward Agent.app/Contents/MacOS/grailward-agent",
+	}
+	for _, p := range translocated {
+		if !isTranslocated(p) {
+			t.Fatalf("isTranslocated(%q) = false, want true", p)
+		}
+	}
+	normal := []string{
+		"/Applications/Grailward Agent.app/Contents/MacOS/grailward-agent",
+		"/Users/me/Applications/Grailward Agent.app/Contents/MacOS/grailward-agent",
+		"/usr/local/bin/grailward-agent",
+		`C:\Program Files\Grailward\grailward-agent.exe`,
+	}
+	for _, p := range normal {
+		if isTranslocated(p) {
+			t.Fatalf("isTranslocated(%q) = true, want false", p)
+		}
+	}
+}
+
+// TestStartAtLoginHealDecision covers the startup self-heal decision, including the
+// two translocation cases: a translocated current path is skipped (never overwrite a
+// good registration with an ephemeral one), while a plist already pointing at a
+// translocated path is rewritten once the app runs from a stable location.
+func TestStartAtLoginHealDecision(t *testing.T) {
+	const good = "/Applications/Grailward Agent.app/Contents/MacOS/grailward-agent"
+	const transloc = "/private/var/folders/62/x/T/AppTranslocation/ABC/d/Grailward Agent.app/Contents/MacOS/grailward-agent"
+
+	cases := []struct {
+		name       string
+		current    string
+		registered string
+		present    bool
+		upToDate   bool
+		want       healAction
+	}{
+		{"translocated current is skipped", transloc, good, true, true, healSkipTranslocated},
+		{"translocated current skipped even if unregistered", transloc, "", false, true, healSkipTranslocated},
+		{"already correct is a no-op", good, good, true, true, healNone},
+		{"missing item is rewritten", good, "", false, true, healRewrite},
+		{"stale content is rewritten", good, good, true, false, healRewrite},
+		{"repairs a plist pointing at a translocated path", good, transloc, true, true, healRewrite},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := startAtLoginHealDecision(c.current, c.registered, c.present, c.upToDate); got != c.want {
+				t.Fatalf("startAtLoginHealDecision = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestSetStartAtLoginTranslocatedRefuses: turning on Start with system from a
+// translocated app must refuse — no login item written, the preference stays off,
+// and the move-to-Applications dialog is shown.
+func TestSetStartAtLoginTranslocatedRefuses(t *testing.T) {
+	enableCalled := false
+	var shown string
+	w := &Watcher{
+		Config:   &Config{},
+		lastLine: map[string]string{},
+		errs:     map[string]string{},
+		execPath: func() (string, error) {
+			return "/private/var/folders/62/x/T/AppTranslocation/ABC/d/Grailward Agent.app/Contents/MacOS/grailward-agent", nil
+		},
+		enableLoginItem: func(string) error { enableCalled = true; return nil },
+		showMessage:     func(m string) error { shown = m; return nil },
+	}
+
+	if err := w.SetStartAtLogin(true); err == nil {
+		t.Fatal("SetStartAtLogin must fail for a translocated app")
+	}
+	if enableCalled {
+		t.Fatal("a translocated app must not write a login item")
+	}
+	if w.StartAtLoginEnabled() {
+		t.Fatal("the preference must stay off when the app is translocated")
+	}
+	if !strings.Contains(shown, "Applications folder") {
+		t.Fatalf("translocation dialog missing move-to-Applications guidance: %q", shown)
+	}
+}
+
 // TestConfigStartAtLoginRoundTrip: default off is omitted from the file; an
 // explicit on round-trips.
 func TestConfigStartAtLoginRoundTrip(t *testing.T) {

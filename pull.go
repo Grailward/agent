@@ -518,6 +518,9 @@ func (w *Watcher) ensureSeams() {
 	if w.confirmUpdate == nil {
 		w.confirmUpdate = ConfirmUpdate
 	}
+	if w.confirmUpdateFound == nil {
+		w.confirmUpdateFound = ConfirmUpdateFound
+	}
 	if w.applyUpdate == nil {
 		w.applyUpdate = ApplyUpdate
 	}

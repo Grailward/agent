@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -73,6 +74,7 @@ type Watcher struct {
 	reset     chan struct{} // wakes the loop when interval/pause changes
 	pullReq   chan struct{} // requests an interactive pull on the scan goroutine
 	updateReq chan struct{} // requests an interactive self-update on the scan goroutine
+	checkReq  chan struct{} // requests a user-initiated update check on the scan goroutine
 	changeDir chan string   // requests a live saves-folder swap on the scan goroutine
 	onStatus  StatusFunc
 	onNewer   NewerFunc
@@ -121,12 +123,14 @@ type Watcher struct {
 	// production manifest URL, the default HTTP client, and the embedded build
 	// Version; confirmUpdate/applyUpdate default to the platform dialog + swap. Tests
 	// point updateURL at an httptest server and inject the interactive/OS seams.
-	updateURL      string
-	updateHTTP     *http.Client
-	currentVersion string
-	confirmUpdate  func(version string) (bool, error)
-	applyUpdate    func(execPath string, file *UpdateFile, data []byte) error
-	showMessage    func(message string) error // defaults to ShowAbout
+	updateURL          string
+	updateHTTP         *http.Client
+	currentVersion     string
+	confirmUpdate      func(version string) (bool, error)
+	confirmUpdateFound func(newVer, curVer string) (bool, error)
+	applyUpdate        func(execPath string, file *UpdateFile, data []byte) error
+	showMessage        func(message string) error // defaults to ShowAbout
+	execPath           func() (string, error)     // defaults to currentExecPath; drives the translocation guard + swap target
 }
 
 func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
@@ -136,29 +140,31 @@ func NewWatcher(cfg *Config, client *Client) (*Watcher, error) {
 	}
 	statePath, _ := SyncStatePath()
 	return &Watcher{
-		Config:           cfg,
-		Client:           client,
-		Pending:          make(map[string]FileStat),
-		Uploaded:         make(map[string]string),
-		lastLine:         make(map[string]string),
-		errs:             make(map[string]string),
-		pendingSidecars:  make(map[string]string),
-		Machine:          hostname,
-		syncState:        LoadSyncState(statePath),
-		interval:         time.Duration(cfg.PollInterval * float64(time.Second)),
-		reset:            make(chan struct{}, 1),
-		pullReq:          make(chan struct{}, 1),
-		updateReq:        make(chan struct{}, 1),
-		changeDir:        make(chan string, 1),
-		confirmPull:      ConfirmPull,
-		resolveConflict:  ResolveConflict,
-		gameRunning:      GameLikelyRunning,
-		enableLoginItem:  enableStartAtLogin,
-		disableLoginItem: disableStartAtLogin,
-		loginItemTarget:  startAtLoginTarget,
-		currentVersion:   Version,
-		confirmUpdate:    ConfirmUpdate,
-		applyUpdate:      ApplyUpdate,
+		Config:             cfg,
+		Client:             client,
+		Pending:            make(map[string]FileStat),
+		Uploaded:           make(map[string]string),
+		lastLine:           make(map[string]string),
+		errs:               make(map[string]string),
+		pendingSidecars:    make(map[string]string),
+		Machine:            hostname,
+		syncState:          LoadSyncState(statePath),
+		interval:           time.Duration(cfg.PollInterval * float64(time.Second)),
+		reset:              make(chan struct{}, 1),
+		pullReq:            make(chan struct{}, 1),
+		updateReq:          make(chan struct{}, 1),
+		checkReq:           make(chan struct{}, 1),
+		changeDir:          make(chan string, 1),
+		confirmPull:        ConfirmPull,
+		resolveConflict:    ResolveConflict,
+		gameRunning:        GameLikelyRunning,
+		enableLoginItem:    enableStartAtLogin,
+		disableLoginItem:   disableStartAtLogin,
+		loginItemTarget:    startAtLoginTarget,
+		currentVersion:     Version,
+		confirmUpdate:      ConfirmUpdate,
+		confirmUpdateFound: ConfirmUpdateFound,
+		applyUpdate:        ApplyUpdate,
 	}, nil
 }
 
@@ -409,9 +415,18 @@ func (w *Watcher) StartAtLoginEnabled() bool {
 // calls touch only per-user paths and need no elevation.
 func (w *Watcher) SetStartAtLogin(on bool) error {
 	if on {
-		exec, err := currentExecPath()
+		exec, err := w.resolveExecPath()
 		if err != nil {
 			return err
+		}
+		// Never register a translocated path: macOS runs a quarantined download from
+		// an ephemeral read-only mount whose path changes every launch, so a login
+		// item pointing there breaks at the next login. Refuse, show the same
+		// move-to-Applications guidance, and leave the preference off so the checkbox
+		// reflects reality instead of lying.
+		if isTranslocated(exec) {
+			w.notify("macOS is running this app from a temporary read-only location.\n\nMove Grailward Agent to your Applications folder with Finder, reopen it, and then turn on Start with system.")
+			return errTranslocatedLoginItem
 		}
 		enable := w.enableLoginItem
 		if enable == nil {
@@ -436,6 +451,22 @@ func (w *Watcher) SetStartAtLogin(on bool) error {
 	w.mu.Unlock()
 	w.persistConfig()
 	return nil
+}
+
+// errTranslocatedLoginItem reports that Start with system was refused because the
+// app is running from a translocated read-only location. The caller (the tray)
+// treats it like any other failure: it logs and leaves the checkbox off.
+var errTranslocatedLoginItem = errors.New("cannot register a login item from a translocated path")
+
+// resolveExecPath returns the running executable path via the execPath seam,
+// falling back to currentExecPath when the seam is unset (a struct-literal Watcher
+// in tests). The seam is only ever assigned at construction, so no lock is needed.
+func (w *Watcher) resolveExecPath() (string, error) {
+	f := w.execPath
+	if f == nil {
+		f = currentExecPath
+	}
+	return f()
 }
 
 // loginItemTargetPath describes where the OS login item lives (the LaunchAgent
@@ -626,6 +657,9 @@ func (w *Watcher) Start() {
 		case <-w.updateReq:
 			scanTimer.Stop()
 			w.runUpdate()
+		case <-w.checkReq:
+			scanTimer.Stop()
+			w.runManualCheck()
 		case dir := <-w.changeDir:
 			scanTimer.Stop()
 			if w.applyDirChange(dir) {

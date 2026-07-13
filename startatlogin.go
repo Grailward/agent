@@ -128,6 +128,45 @@ func startAtLoginNeedsHeal(registered string, present bool, current string) bool
 	return !present || registered != current
 }
 
+// isTranslocated reports whether execPath sits under an App Translocation mount —
+// the read-only, per-launch-ephemeral location Gatekeeper uses to run a quarantined
+// .app straight from a download (…/AppTranslocation/<uuid>/d/<App>.app/…). Both
+// writing a login item to such a path (it changes every launch) and staging an
+// update beside the bundle (the mount is read-only) fail there, so both callers
+// refuse when it is true. Pure string logic (a path segment named
+// "AppTranslocation"), the single source shared by both uses; on Windows no path
+// carries the segment, so it is a harmless no-op.
+func isTranslocated(execPath string) bool {
+	return strings.Contains(execPath, "/AppTranslocation/")
+}
+
+// healAction is the decision the startup self-heal makes for the login item.
+type healAction int
+
+const (
+	healNone             healAction = iota // the registered item is already correct
+	healSkipTranslocated                   // running translocated — never write an ephemeral path
+	healRewrite                            // rewrite the login item to point at current
+)
+
+// startAtLoginHealDecision decides what the startup self-heal should do given the
+// running executable, the currently registered path, whether one is registered, and
+// whether the plist body is up to date. A translocated current path is skipped so a
+// good registration is never overwritten with an ephemeral one; otherwise it
+// rewrites when the item is missing, points elsewhere, or is stale in content — which
+// also repairs a plist already pointing at a translocated path once the app is run
+// normally from a stable location. Pure, so the decision is unit-testable without
+// touching os.Executable or the real login item.
+func startAtLoginHealDecision(current, registered string, present, upToDate bool) healAction {
+	if isTranslocated(current) {
+		return healSkipTranslocated
+	}
+	if !startAtLoginNeedsHeal(registered, present, current) && upToDate {
+		return healNone
+	}
+	return healRewrite
+}
+
 // currentExecPath returns the absolute, symlink-resolved path of the running
 // executable — used both to register the login item and to self-heal a stale one,
 // so both sides compare the same canonical form.
@@ -157,12 +196,17 @@ func maybeHealStartAtLogin(cfg *Config) {
 		return
 	}
 	registered, present := startAtLoginExecPath()
-	if !startAtLoginNeedsHeal(registered, present, current) && startAtLoginUpToDate(current) {
+	switch startAtLoginHealDecision(current, registered, present, startAtLoginUpToDate(current)) {
+	case healNone:
 		return
-	}
-	if err := enableStartAtLogin(current); err != nil {
-		log.Printf("Could not refresh start-at-login item: %v", err)
+	case healSkipTranslocated:
+		log.Printf("Start-at-login self-heal skipped: running from a translocated read-only location (%s); not overwriting the login item with an ephemeral path", current)
 		return
+	case healRewrite:
+		if err := enableStartAtLogin(current); err != nil {
+			log.Printf("Could not refresh start-at-login item: %v", err)
+			return
+		}
+		log.Printf("Start-at-login item refreshed to point at %s", current)
 	}
-	log.Printf("Start-at-login item refreshed to point at %s", current)
 }
