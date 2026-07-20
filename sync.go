@@ -18,19 +18,18 @@ type Manifest struct {
 
 // ManifestEntry describes one save slot on the server. Characters and shared
 // stashes carry the same fields the agent needs (filename, sha, download_path);
-// the extra descriptive fields (name, mode, variant, held_by) are decoded when
-// present but are not required for the decision logic.
+// the extra descriptive fields (name, mode, variant) are decoded when present
+// but are not required for the decision logic.
 type ManifestEntry struct {
-	Name          string  `json:"name"`
-	Mode          string  `json:"mode"`
-	Variant       string  `json:"variant"`
-	Filename      string  `json:"filename"`
-	SHA256        string  `json:"sha256"`
-	Size          int64   `json:"size"`
-	SyncedAt      string  `json:"synced_at"`
-	SourceMachine string  `json:"source_machine"`
-	HeldBy        *string `json:"held_by"`
-	DownloadPath  string  `json:"download_path"`
+	Name          string `json:"name"`
+	Mode          string `json:"mode"`
+	Variant       string `json:"variant"`
+	Filename      string `json:"filename"`
+	SHA256        string `json:"sha256"`
+	Size          int64  `json:"size"`
+	SyncedAt      string `json:"synced_at"`
+	SourceMachine string `json:"source_machine"`
+	DownloadPath  string `json:"download_path"`
 	// Sidecars lists the map-exploration files that travel with a character save
 	// (characters only; shared-stash entries never carry these). Both fields are
 	// decoded tolerantly: absent on an entry means a zero value (no sidecars).

@@ -101,7 +101,14 @@ else
     echo "Warning: 'lipo' not found, skipping universal binary and .app bundle."
 fi
 
-# 3. Windows AMD64 — only if a mingw cross toolchain is available.
+# 3. Linux AMD64 — one static build covers both desktop Linux and the Steam Deck
+#    (SteamOS is x86_64 Arch with KDE Plasma). The systray backend talks to
+#    StatusNotifier/DBus in pure Go, so no CGO and no cross toolchain are needed;
+#    this step always runs (CGO_ENABLED=0 overrides the export above for this build).
+echo "Building Linux AMD64..."
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$LDFLAGS" -o build/grailward-agent-linux-amd64
+
+# 4. Windows AMD64 — only if a mingw cross toolchain is available.
 #    -H windowsgui hides the console window (background tray app).
 if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     echo "Building Windows AMD64..."

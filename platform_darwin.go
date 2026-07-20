@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -474,24 +473,6 @@ func ResolveConflict(filename string) (ConflictChoice, error) {
 	}
 }
 
-// gameProcessPattern matches the running D2R game binary in the CrossOver/Wine
-// command line. It targets the real executable "D2R.exe" (an extended-regexp
-// literal dot) and deliberately does NOT match the CrossOver engine helper
-// "D2R-CXEngine", which can linger as a wine leftover after the game exits — a
-// bare "D2R" match would take that as an open game and refuse writes forever.
-// Passed verbatim to pgrep -f (POSIX ERE) and to gameProcessRe below (RE2); the
-// pattern is simple enough to mean the same in both.
-const gameProcessPattern = `D2R\.exe`
-
-var gameProcessRe = regexp.MustCompile(gameProcessPattern)
-
-// matchesGameProcess reports whether a process command line looks like the real
-// D2R game binary. Kept pure and package-level so the exact pattern handed to
-// pgrep is unit-testable without a running game.
-func matchesGameProcess(cmdline string) bool {
-	return gameProcessRe.MatchString(cmdline)
-}
-
 // GameLikelyRunning is a best-effort, macOS reinforcement before a write (never
 // a substitute for the confirmation): it looks for a D2R process and, failing
 // that, for any save touched in the last ~90s (a likely active session).
@@ -507,33 +488,4 @@ func GameLikelyRunning(savesDir string, before time.Time) (bool, string) {
 		return true, "a save changed in the last 90 seconds — a game session may be active"
 	}
 	return false, ""
-}
-
-// recentlySaved reports whether any .d2s/.d2i in dir was modified within the
-// given window but strictly before the given bound (which excludes the agent's
-// own writes during the current pull run).
-func recentlySaved(dir string, within time.Duration, before time.Time) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	cutoff := time.Now().Add(-within)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		ext := strings.ToLower(filepath.Ext(e.Name()))
-		if ext != ".d2s" && ext != ".d2i" {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		mt := info.ModTime()
-		if mt.After(cutoff) && mt.Before(before) {
-			return true
-		}
-	}
-	return false
 }

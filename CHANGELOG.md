@@ -7,6 +7,15 @@ release are published at [grailward.com/download](https://grailward.com/download
 Versions up to v0.2.0 predate this public mirror, so they have no corresponding
 source snapshot here; they are listed for completeness.
 
+## v0.6.0 — 2026-07-20
+
+- **Linux and Steam Deck support.** The agent now runs on Linux, including the Steam
+  Deck's Desktop Mode. On first run it auto-detects your Diablo II: Resurrected saves
+  folder inside the usual Steam/Proton prefixes (including a prefix on the Deck's
+  microSD card), Lutris, or a plain Wine install, so you rarely have to pick it by
+  hand. Native prompts and confirmations use kdialog (KDE) with a zenity (GNOME)
+  fallback, and "Start with system" registers a standard XDG autostart entry.
+
 ## v0.5.2 — 2026-07-13
 
 - **"Check for updates…" in the menu.** A new, always-visible menu item lets you
